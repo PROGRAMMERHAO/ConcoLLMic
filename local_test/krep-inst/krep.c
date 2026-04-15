@@ -1,0 +1,5205 @@
+/* krep - A high-performance string search utility
+ *
+ * Author: Davide Santangelo
+ * Year: 2025
+ *
+ */
+
+// Define _GNU_SOURCE to potentially enable MAP_POPULATE and memrchr
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include "krep.h"         // Include the header file
+#include "aho_corasick.h" // Include AC header for build/free functions
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <ctype.h>
+#include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/mman.h> // Include for mmap, madvise constants
+#include <inttypes.h> // For PRIu64 macro
+#include <errno.h>
+#include <limits.h>    // For SIZE_MAX, PATH_MAX
+#include <regex.h>     // For POSIX regex support
+#include <dirent.h>    // For directory operations
+#include <sys/types.h> // For mode_t, DIR*, struct dirent
+#include <getopt.h>    // For command-line parsing
+#include <stdatomic.h> // For atomic operations in multithreading
+
+// Add forward declaration for is_repetitive_pattern here
+static bool is_repetitive_pattern(const char *pattern, size_t pattern_len);
+
+// Forward declaration for ensure_line_buffer_capacity
+static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr, size_t current_pos, size_t needed);
+
+// SIMD Intrinsics Includes based on compiler flags (from Makefile)
+#if defined(__AVX2__)
+#include <immintrin.h> // AVX2 intrinsics
+#define KREP_USE_AVX2 1
+#else
+#define KREP_USE_AVX2 0
+#endif
+
+#if defined(__SSE4_2__)
+#include <nmmintrin.h> // SSE4.2 intrinsics
+#define KREP_USE_SSE42 1
+#else
+#define KREP_USE_SSE42 0
+#endif
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h> // NEON intrinsics
+#define KREP_USE_NEON 1
+#else
+#define KREP_USE_NEON 0
+#endif
+
+// Constants
+#define MAX_PATTERN_LENGTH 1024
+#define DEFAULT_THREAD_COUNT 0
+#define MIN_CHUNK_SIZE (4 * 1024 * 1024)
+#define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
+#define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
+#define VERSION "1.2"
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+#define BINARY_CHECK_BUFFER_SIZE 1024  // Bytes to check for binary content
+#define MAX_PATTERN_FILE_LINE_LEN 2048 // Max length for a pattern line read from file
+
+// Determine max pattern length usable by SIMD based on highest available instruction set
+// NOTE: Current SIMD implementations only support case-sensitive search.
+#if KREP_USE_AVX2
+// AVX2 implementation handles <= 32 bytes.
+const size_t SIMD_MAX_PATTERN_LEN = 32;
+#elif KREP_USE_SSE42
+const size_t SIMD_MAX_PATTERN_LEN = 16;
+#elif KREP_USE_NEON
+const size_t SIMD_MAX_PATTERN_LEN = 16;
+#else
+const size_t SIMD_MAX_PATTERN_LEN = 0;
+#endif
+
+// Global state (Consider encapsulating if becomes too large)
+static bool color_output_enabled KREP_UNUSED = false;
+static bool only_matching = false; // -o flag
+static bool force_no_simd = false;
+static atomic_bool global_match_found_flag = false; // Used in recursive search
+
+// Global lookup table for fast lowercasing
+unsigned char lower_table[256]; // Remove static
+
+// --- Match Result Management ---
+
+// Initialize match result structure
+match_result_t *match_result_init(uint64_t initial_capacity)
+{
+    fprintf(stderr, "[krep.c] enter match_result_init 1\n");
+    match_result_t *result = malloc(sizeof(match_result_t));
+    if (!result)
+    {
+        perror("malloc failed for match_result_t");
+        return NULL;
+    }
+    // fprintf(stderr, "[krep.c] exit match_result_init 1\n");
+
+    // Check for overflow cases before allocating memory for positions
+    if (initial_capacity == 0)
+    {
+        fprintf(stderr, "[krep.c] enter match_result_init 2\n");
+        initial_capacity = 16; // Default initial size
+        // fprintf(stderr, "[krep.c] exit match_result_init 2\n");
+    }
+    else if (initial_capacity > SIZE_MAX / sizeof(match_position_t))
+    {
+        fprintf(stderr, "[krep.c] enter match_result_init 3\n");
+        // This allocation would overflow, refuse to proceed
+        fprintf(stderr, "Error: Requested capacity too large for match_result_init\n");
+        free(result);
+        return NULL;
+        // fprintf(stderr, "[krep.c] exit match_result_init 3\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter match_result_init 4\n");
+    result->positions = malloc(initial_capacity * sizeof(match_position_t));
+    if (!result->positions)
+    {
+        perror("malloc failed for match positions array");
+        free(result);
+        return NULL;
+    }
+
+    result->count = 0;
+    result->capacity = initial_capacity;
+    return result;
+    // fprintf(stderr, "[krep.c] exit match_result_init 4\n");
+}
+
+// Add a match to the result structure, reallocating if necessary
+inline bool match_result_add(match_result_t *result, size_t start_offset, size_t end_offset)
+{
+    fprintf(stderr, "[krep.c] enter match_result_add 1\n");
+    if (!result)
+        return false;
+    // fprintf(stderr, "[krep.c] exit match_result_add 1\n");
+
+    // Check if we need to expand the capacity
+    if (result->count >= result->capacity)
+    {
+        fprintf(stderr, "[krep.c] enter match_result_add 2\n");
+        // Fast path for initial allocation
+        if (result->capacity == 0)
+        {
+            fprintf(stderr, "[krep.c] enter match_result_add 3\n");
+            size_t initial_capacity = 16;
+            result->positions = malloc(initial_capacity * sizeof(match_position_t));
+            if (!result->positions)
+            {
+                perror("Error allocating initial match positions array");
+                return false;
+            }
+            result->capacity = initial_capacity;
+            // fprintf(stderr, "[krep.c] exit match_result_add 3\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter match_result_add 4\n");
+            // Calculate new capacity with overflow protection
+            uint64_t new_capacity;
+
+            // Check for potential overflow in capacity doubling
+            if (result->capacity > SIZE_MAX / (2 * sizeof(match_position_t)))
+            {
+                fprintf(stderr, "[krep.c] enter match_result_add 5\n");
+                // Try to allocate maximum safe capacity if doubling would overflow
+                new_capacity = SIZE_MAX / sizeof(match_position_t);
+
+                // If we can't grow further, signal failure
+                if (new_capacity <= result->capacity)
+                {
+                    fprintf(stderr, "Error: Cannot increase result capacity further (at %" PRIu64 " matches).\n",
+                            result->capacity);
+                    return false;
+                }
+                // fprintf(stderr, "[krep.c] exit match_result_add 5\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter match_result_add 6\n");
+                // Normal doubling strategy for growth
+                new_capacity = result->capacity * 2;
+                // fprintf(stderr, "[krep.c] exit match_result_add 6\n");
+            }
+
+            fprintf(stderr, "[krep.c] enter match_result_add 7\n");
+            // Perform the reallocation
+            match_position_t *new_positions = realloc(result->positions,
+                                                      new_capacity * sizeof(match_position_t));
+            if (!new_positions)
+            {
+                perror("Error reallocating match positions array");
+                // Existing array is preserved by realloc semantics
+                return false;
+            }
+
+            result->positions = new_positions;
+            result->capacity = new_capacity;
+            // fprintf(stderr, "[krep.c] exit match_result_add 7\n");
+            // fprintf(stderr, "[krep.c] exit match_result_add 4\n");
+        }
+        // fprintf(stderr, "[krep.c] exit match_result_add 2\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter match_result_add 8\n");
+    // Add the new match position
+    result->positions[result->count].start_offset = start_offset;
+    result->positions[result->count].end_offset = end_offset;
+    result->count++;
+
+    return true;
+    // fprintf(stderr, "[krep.c] exit match_result_add 8\n");
+}
+
+// Free memory associated with match result structure
+void match_result_free(match_result_t *result)
+{
+    fprintf(stderr, "[krep.c] enter match_result_free 1\n");
+    if (!result)
+        return;
+    if (result->positions)
+        free(result->positions);
+    free(result);
+    // fprintf(stderr, "[krep.c] exit match_result_free 1\n");
+}
+
+// Merge results from a source list into a destination list
+// Assumes destination has enough capacity (caller must ensure or realloc)
+// Adjusts offsets from source based on chunk_offset
+bool match_result_merge(match_result_t *dest, const match_result_t *src, size_t chunk_offset)
+{
+    fprintf(stderr, "[krep.c] enter match_result_merge 1\n");
+    if (!dest || !src || src->count == 0)
+        return true; // Nothing to merge or invalid input
+    // fprintf(stderr, "[krep.c] exit match_result_merge 1\n");
+
+    // Ensure destination has enough capacity
+    fprintf(stderr, "[krep.c] enter match_result_merge 2\n");
+    uint64_t required_capacity = dest->count + src->count;
+    if (required_capacity < dest->count)
+    { // Check for overflow
+        fprintf(stderr, "Error: Required capacity overflow during merge.\n");
+        return false;
+    }
+    // fprintf(stderr, "[krep.c] exit match_result_merge 2\n");
+
+    if (required_capacity > dest->capacity)
+    {
+        fprintf(stderr, "[krep.c] enter match_result_merge 3\n");
+        // Prevent potential integer overflow during capacity calculation
+        uint64_t new_capacity = dest->capacity;
+        if (new_capacity == 0)
+            new_capacity = 16;
+        while (new_capacity < required_capacity)
+        {
+            fprintf(stderr, "[krep.c] enter match_result_merge 4\n");
+            // Check for potential overflow before doubling
+            if (new_capacity > SIZE_MAX / (2 * sizeof(match_position_t)))
+            {
+                fprintf(stderr, "[krep.c] enter match_result_merge 5\n");
+                new_capacity = required_capacity; // Try exact size
+                if (new_capacity < required_capacity)
+                { // Check again
+                    fprintf(stderr, "Error: Cannot allocate sufficient capacity for merge (overflow).\n");
+                    return false;
+                }
+                break; // Use exact required capacity
+                // fprintf(stderr, "[krep.c] exit match_result_merge 5\n");
+            }
+            fprintf(stderr, "[krep.c] enter match_result_merge 6\n");
+            new_capacity *= 2;
+            // Handle case where doubling overflows but required_capacity is still reachable
+            if (new_capacity < dest->capacity)
+            {
+                fprintf(stderr, "[krep.c] enter match_result_merge 7\n");
+                new_capacity = required_capacity;
+                if (new_capacity < required_capacity)
+                {
+                    fprintf(stderr, "Error: Cannot allocate sufficient capacity for merge (overflow 2).\n");
+                    return false;
+                }
+                break;
+                // fprintf(stderr, "[krep.c] exit match_result_merge 7\n");
+            }
+            // fprintf(stderr, "[krep.c] exit match_result_merge 6\n");
+            // fprintf(stderr, "[krep.c] exit match_result_merge 4\n");
+        }
+        fprintf(stderr, "[krep.c] enter match_result_merge 8\n");
+        // Final check if required_capacity itself is too large
+        if (new_capacity < required_capacity)
+        {
+            fprintf(stderr, "Error: Cannot allocate sufficient capacity for merge (required > new).\n");
+            return false;
+        }
+
+        match_position_t *new_positions = realloc(dest->positions, new_capacity * sizeof(match_position_t));
+        if (!new_positions)
+        {
+            perror("Error reallocating destination match positions for merge");
+            return false;
+        }
+        dest->positions = new_positions;
+        dest->capacity = new_capacity;
+        // fprintf(stderr, "[krep.c] exit match_result_merge 8\n");
+        // fprintf(stderr, "[krep.c] exit match_result_merge 3\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter match_result_merge 9\n");
+    // Copy and adjust offsets
+    for (uint64_t i = 0; i < src->count; ++i)
+    {
+        fprintf(stderr, "[krep.c] enter match_result_merge 10\n");
+        dest->positions[dest->count].start_offset = src->positions[i].start_offset + chunk_offset;
+        dest->positions[dest->count].end_offset = src->positions[i].end_offset + chunk_offset;
+        dest->count++;
+        // fprintf(stderr, "[krep.c] exit match_result_merge 10\n");
+    }
+    return true;
+    // fprintf(stderr, "[krep.c] exit match_result_merge 9\n");
+}
+
+// --- Line Finding Functions ---
+
+// Find the start of the line containing the given position
+// Uses memrchr (GNU extension) if available for potential speedup, otherwise manual loop.
+size_t find_line_start(const char *text, size_t max_len, size_t pos)
+{
+    fprintf(stderr, "[krep.c] enter find_line_start 1\n");
+    if (pos > max_len)
+        pos = max_len; // Ensure pos is within bounds
+    // fprintf(stderr, "[krep.c] exit find_line_start 1\n");
+
+    if (pos == 0)
+        return 0; // Already at the start
+
+// Check if memrchr is likely available (common on Linux/glibc)
+#if defined(_GNU_SOURCE) && !defined(__APPLE__) && !defined(_WIN32) // Crude check, refine if needed
+    fprintf(stderr, "[krep.c] enter find_line_start 2\n");
+    // Use memrchr to find the last newline before or at pos-1
+    const char *start_ptr = text;
+    // memrchr searches backwards from text + pos - 1 for 'pos' bytes
+    size_t search_len = pos;
+    void *newline_ptr = memrchr(start_ptr, '\n', search_len);
+
+    if (newline_ptr != NULL)
+    {
+        fprintf(stderr, "[krep.c] enter find_line_start 3\n");
+        // Found a newline, the line starts *after* it
+        return (const char *)newline_ptr - start_ptr + 1;
+        // fprintf(stderr, "[krep.c] exit find_line_start 3\n");
+    }
+    else
+    {
+        fprintf(stderr, "[krep.c] enter find_line_start 4\n");
+        // No newline found before pos, so the line starts at the beginning of the text
+        return 0;
+        // fprintf(stderr, "[krep.c] exit find_line_start 4\n");
+    }
+    // fprintf(stderr, "[krep.c] exit find_line_start 2\n");
+#else
+    fprintf(stderr, "[krep.c] enter find_line_start 5\n");
+    // Fallback to manual loop if memrchr is not available or not detected
+    size_t current = pos;
+    while (current > 0 && text[current - 1] != '\n')
+    {
+        fprintf(stderr, "[krep.c] enter find_line_start 6\n");
+        current--;
+        // fprintf(stderr, "[krep.c] exit find_line_start 6\n");
+    }
+    return current;
+    // fprintf(stderr, "[krep.c] exit find_line_start 5\n");
+#endif
+}
+
+// Find the end of the line containing the given position
+size_t find_line_end(const char *text, size_t text_len, size_t pos)
+{
+    fprintf(stderr, "[krep.c] enter find_line_end 1\n");
+    if (pos >= text_len)
+        return text_len; // Already at or past the end
+    // fprintf(stderr, "[krep.c] exit find_line_end 1\n");
+
+    fprintf(stderr, "[krep.c] enter find_line_end 2\n");
+    const char *newline_ptr = memchr(text + pos, '\n', text_len - pos);
+    return (newline_ptr == NULL) ? text_len : (size_t)(newline_ptr - text);
+    // fprintf(stderr, "[krep.c] exit find_line_end 2\n");
+
+    // Original loop kept for reference:
+    // while (pos < text_len && text[pos] != '\n')
+    // {
+    //     pos++;
+    // }
+    // return pos; // Returns index of '\n' or text_len if no newline found
+}
+
+// --- Printing Function ---
+
+// Comparison function for qsort on match_position_t by start_offset
+static int compare_match_positions(const void *a, const void *b)
+{
+    fprintf(stderr, "[krep.c] enter compare_match_positions 1\n");
+    const match_position_t *pa = (const match_position_t *)a;
+    const match_position_t *pb = (const match_position_t *)b;
+    if (pa->start_offset < pb->start_offset)
+        return -1;
+    if (pa->start_offset > pb->start_offset)
+        return 1;
+    // Secondary sort by end offset if starts are equal (optional, but can be useful)
+    if (pa->end_offset < pb->end_offset)
+        return -1;
+    if (pa->end_offset > pb->end_offset)
+        return 1;
+    return 0;
+    // fprintf(stderr, "[krep.c] exit compare_match_positions 1\n");
+}
+
+// Helper function to safely append data to a batch buffer
+// Modifies the current write pointer and batch position pointer
+static inline void safe_append_to_batch(char **current_write_ptr_ptr, char *batch_buffer_end, size_t *batch_pos_ptr, size_t batch_buffer_size, const char *data, size_t data_len)
+{
+    fprintf(stderr, "[krep.c] enter safe_append_to_batch 1\n");
+    char *current_write_ptr = *current_write_ptr_ptr;
+    size_t available_space = batch_buffer_end - current_write_ptr;
+    // fprintf(stderr, "[krep.c] exit safe_append_to_batch 1\n");
+
+    if (data_len <= available_space)
+    {
+        fprintf(stderr, "[krep.c] enter safe_append_to_batch 2\n");
+        memcpy(current_write_ptr, data, data_len);
+        *current_write_ptr_ptr += data_len; // Update the caller's pointer
+        // fprintf(stderr, "[krep.c] exit safe_append_to_batch 2\n");
+    }
+    else
+    {
+        fprintf(stderr, "[krep.c] enter safe_append_to_batch 3\n");
+        // Handle buffer overflow scenario (truncate)
+        if (available_space > 0)
+        {
+            fprintf(stderr, "[krep.c] enter safe_append_to_batch 4\n");
+            memcpy(current_write_ptr, data, available_space);
+            *current_write_ptr_ptr += available_space; // Update the caller's pointer
+            // fprintf(stderr, "[krep.c] exit safe_append_to_batch 4\n");
+        }
+        // Mark buffer as full by setting the position to the size
+        *batch_pos_ptr = batch_buffer_size;
+        // fprintf(stderr, "[krep.c] exit safe_append_to_batch 3\n");
+    }
+}
+size_t print_matching_items(const char *filename, const char *text, size_t text_len, const match_result_t *result, const search_params_t *params)
+{
+    fprintf(stderr, "[krep.c] enter print_matching_items 1\n");
+    // Basic validation: No results, no text, or zero matches means nothing to print.
+    if (!result || !text || result->count == 0)
+        return 0;
+    // fprintf(stderr, "[krep.c] exit print_matching_items 1\n");
+
+    fprintf(stderr, "[krep.c] enter print_matching_items 2\n");
+    size_t items_printed_count = 0;
+    size_t max_count = params->max_count; // Get max_count from params
+
+    // Get global configuration values
+    extern bool only_matching;        // External variable declared in krep.h
+    extern bool color_output_enabled; // External variable declared in krep.h
+
+// --- Setup enhanced buffering ---
+// Use a larger stdout buffer than default to reduce syscalls
+#define STDOUT_BUFFER_SIZE (8 * 1024 * 1024) // 8MB stdout buffer
+    static char stdout_buf[STDOUT_BUFFER_SIZE];
+    setvbuf(stdout, stdout_buf, _IOFBF, STDOUT_BUFFER_SIZE);
+
+// --- Preallocate reusable line buffer for formatting ---
+#define LINE_BUFFER_INITIAL_SIZE (512 * 1024) // Start with 512KB
+    char *line_buffer = malloc(LINE_BUFFER_INITIAL_SIZE);
+    if (!line_buffer)
+    {
+        fprintf(stderr, "[krep.c] enter print_matching_items 3\n");
+        perror("malloc failed for line buffer");
+        return 0;
+        // fprintf(stderr, "[krep.c] exit print_matching_items 3\n");
+    }
+    // fprintf(stderr, "[krep.c] exit print_matching_items 2\n");
+
+    fprintf(stderr, "[krep.c] enter print_matching_items 4\n");
+    size_t line_buffer_capacity = LINE_BUFFER_INITIAL_SIZE;
+
+// --- Preallocate match position storage ---
+#define MAX_MATCHES_PER_LINE 2048 // Doubled from original to handle more dense matches
+    static match_position_t line_match_positions[MAX_MATCHES_PER_LINE];
+
+    // --- Precompute constant string lengths ---
+    // Cache color codes and their lengths for better performance
+    const char *color_filename = KREP_COLOR_FILENAME;
+    const char *color_reset = KREP_COLOR_RESET;
+    const char *color_separator = KREP_COLOR_SEPARATOR;
+    const char *color_text = KREP_COLOR_TEXT;
+    const char *color_match = KREP_COLOR_MATCH;
+
+    // Precompute lengths to avoid repeated strlen calls
+    size_t len_color_reset = color_output_enabled ? strlen(color_reset) : 0;
+    size_t len_color_text = color_output_enabled ? strlen(color_text) : 0;
+    size_t len_color_match = color_output_enabled ? strlen(color_match) : 0;
+    // fprintf(stderr, "[krep.c] exit print_matching_items 4\n");
+
+    // ========================================================================
+    // --- Mode: Only Matching Parts (-o) ---
+    // ========================================================================
+    if (only_matching)
+    {
+        fprintf(stderr, "[krep.c] enter print_matching_items 5\n");
+// Use a larger batch buffer for aggregating output before system calls
+#define O_BATCH_BUFFER_SIZE (8 * 1024 * 1024) // 8MB batch buffer (doubled from original)
+        static char o_batch_buffer[O_BATCH_BUFFER_SIZE];
+        size_t o_batch_pos = 0; // Current position in the batch buffer
+
+        // --- Fast line number tracking ---
+        // Precompute newline positions for faster line number calculation
+        size_t *newline_positions = NULL;
+        size_t num_newlines = 0;
+        size_t newline_capacity = 0;
+
+        // Only precompute newline positions if we have more than a threshold number of matches
+        if (result->count > 10)
+        {
+            fprintf(stderr, "[krep.c] enter print_matching_items 6\n");
+            // Count newlines first to allocate properly
+            for (size_t i = 0; i < text_len; i++)
+            {
+                if (text[i] == '\n')
+                    num_newlines++;
+            }
+
+            // Allocate array for newline positions
+            newline_capacity = num_newlines + 1; // +1 for the implicit newline at the end
+            newline_positions = malloc(newline_capacity * sizeof(size_t));
+
+            // Populate the array if allocation succeeded
+            if (newline_positions)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 7\n");
+                size_t idx = 0;
+                for (size_t i = 0; i < text_len; i++)
+                {
+                    if (text[i] == '\n')
+                    {
+                        newline_positions[idx++] = i;
+                    }
+                }
+                // fprintf(stderr, "[krep.c] exit print_matching_items 7\n");
+            }
+            // fprintf(stderr, "[krep.c] exit print_matching_items 6\n");
+        }
+
+        // Precompute the filename prefix string (including colors if enabled)
+        char filename_prefix[PATH_MAX + 64] = ""; // Extra space for colors/separator
+        size_t filename_prefix_len = 0;
+        if (filename)
+        {
+            fprintf(stderr, "[krep.c] enter print_matching_items 8\n");
+            if (color_output_enabled)
+            {
+                filename_prefix_len = snprintf(filename_prefix, sizeof(filename_prefix), "%s%s%s%s:",
+                                               color_filename, filename, color_reset, color_separator);
+            }
+            else
+            {
+                filename_prefix_len = snprintf(filename_prefix, sizeof(filename_prefix), "%s:", filename);
+            }
+
+            // Safety check on filename_prefix length
+            if (filename_prefix_len <= 0 || filename_prefix_len >= sizeof(filename_prefix))
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 9\n");
+                filename_prefix_len = (sizeof(filename_prefix) > 1) ? sizeof(filename_prefix) - 1 : 0;
+                if (filename_prefix_len > 0)
+                {
+                    filename_prefix[filename_prefix_len] = '\0';
+                }
+                else
+                {
+                    filename_prefix_len = 0;
+                }
+                // fprintf(stderr, "[krep.c] exit print_matching_items 9\n");
+            }
+            // fprintf(stderr, "[krep.c] exit print_matching_items 8\n");
+        }
+
+        // --- Process matches in batches for better performance ---
+        size_t current_line_number = 1;
+        size_t last_scanned_offset = 0;
+        size_t last_newline_idx = 0;
+
+        // Pre-allocate a static buffer for line numbers to avoid repeated format calls
+        char lineno_buffer[32]; // Large enough for any reasonable line number
+
+        // Iterate through all matches in order
+        for (uint64_t i = 0; i < result->count; i++)
+        {
+            fprintf(stderr, "[krep.c] enter print_matching_items 10\n");
+            // Check max_count limit before processing each match
+            if (max_count != SIZE_MAX && items_printed_count >= max_count)
+            {
+                break; // Stop processing if limit is reached
+            }
+
+            size_t start = result->positions[i].start_offset;
+            size_t end = result->positions[i].end_offset;
+
+            // Validation and bounds checking
+            if (start >= text_len || start > end)
+            {
+                continue; // Skip invalid match
+            }
+            if (end > text_len)
+            {
+                end = text_len; // Clamp end offset
+            }
+            size_t len = end - start;
+
+            // --- Optimized Line Number Calculation ---
+            // Faster line number calculation using precomputed newline positions when available
+            if (newline_positions && num_newlines > 0)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 11\n");
+                // Binary search to find the position in the newlines array
+                size_t left = 0;
+                size_t right = num_newlines - 1;
+
+                // Find the first newline position greater than start
+                while (left <= right)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 12\n");
+                    size_t mid = left + (right - left) / 2;
+                    if (newline_positions[mid] < start)
+                    {
+                        left = mid + 1;
+                    }
+                    else
+                    {
+                        if (mid == 0 || newline_positions[mid - 1] < start)
+                        {
+                            last_newline_idx = mid;
+                            break;
+                        }
+                        right = mid - 1;
+                    }
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 12\n");
+                }
+
+                // Line number is the index of the first newline after start, plus 1
+                // (or the count of newlines before start, plus 1)
+                if (last_newline_idx > 0 && newline_positions[last_newline_idx - 1] >= start)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 13\n");
+                    last_newline_idx--;
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 13\n");
+                }
+                current_line_number = last_newline_idx + 1;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 11\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 14\n");
+                // Fallback: Count newlines in the segment from last position to current match
+                if (start > last_scanned_offset)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 15\n");
+                    const char *scan_ptr = text + last_scanned_offset;
+                    const char *end_scan_ptr = text + start;
+
+                    // Fast newline counting with memchr
+                    while (scan_ptr < end_scan_ptr)
+                    {
+                        fprintf(stderr, "[krep.c] enter print_matching_items 16\n");
+                        const void *newline_found = memchr(scan_ptr, '\n', end_scan_ptr - scan_ptr);
+                        if (newline_found)
+                        {
+                            fprintf(stderr, "[krep.c] enter print_matching_items 17\n");
+                            current_line_number++;
+                            scan_ptr = (const char *)newline_found + 1;
+                            // fprintf(stderr, "[krep.c] exit print_matching_items 17\n");
+                        }
+                        else
+                        {
+                            fprintf(stderr, "[krep.c] enter print_matching_items 18\n");
+                            break;
+                            // fprintf(stderr, "[krep.c] exit print_matching_items 18\n");
+                        }
+                        // fprintf(stderr, "[krep.c] exit print_matching_items 16\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 15\n");
+                }
+                // fprintf(stderr, "[krep.c] exit print_matching_items 14\n");
+            }
+            last_scanned_offset = start; // Update for next iteration
+
+            // Format line number into a temporary buffer
+            int lineno_len = snprintf(lineno_buffer, sizeof(lineno_buffer), "%zu:", current_line_number);
+            if (lineno_len <= 0 || (size_t)lineno_len >= sizeof(lineno_buffer))
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 19\n");
+                strcpy(lineno_buffer, "ERR:");
+                lineno_len = 4;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 19\n");
+            }
+
+            // Calculate the total size required in the batch buffer for this entry
+            // Note: This is an estimate; actual size might differ slightly if newlines are replaced.
+            size_t required_estimate = filename_prefix_len + lineno_len + len + 1; // +1 for newline
+            if (color_output_enabled)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 20\n");
+                required_estimate += len_color_match + len_color_reset;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 20\n");
+            }
+
+            // Flush the batch buffer to stdout if the new entry won't fit (use estimate)
+            if (o_batch_pos + required_estimate > O_BATCH_BUFFER_SIZE)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 21\n");
+                if (fwrite(o_batch_buffer, 1, o_batch_pos, stdout) != o_batch_pos)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 22\n");
+                    perror("Error writing batch buffer to stdout (-o mode)");
+                    // Consider how to handle write errors; maybe break or return error count?
+                    break;
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 22\n");
+                }
+                o_batch_pos = 0; // Reset batch buffer position
+                // fprintf(stderr, "[krep.c] exit print_matching_items 21\n");
+            }
+
+            // --- Efficient append to batch buffer using direct pointer manipulation ---
+            char *current_write_ptr = o_batch_buffer + o_batch_pos;
+            char *batch_buffer_end = o_batch_buffer + O_BATCH_BUFFER_SIZE; // Boundary check
+
+            // 1. Copy filename prefix (if any)
+            if (filename_prefix_len > 0)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 23\n");
+                safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, filename_prefix, filename_prefix_len);
+                // fprintf(stderr, "[krep.c] exit print_matching_items 23\n");
+            }
+
+            // 2. Copy line number
+            safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, lineno_buffer, lineno_len);
+
+            // 3. Start color for match (if enabled)
+            if (color_output_enabled)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 24\n");
+                safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, color_match, len_color_match);
+                // fprintf(stderr, "[krep.c] exit print_matching_items 24\n");
+            }
+
+            // 4. Copy the matched text, replacing internal newlines
+            const char *match_ptr = text + start;
+            for (size_t k = 0; k < len; ++k)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 25\n");
+                char current_char = match_ptr[k];
+                if (current_char == '\n')
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 26\n");
+                    safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, " ", 1);
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 26\n");
+                }
+                else
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 27\n");
+                    safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, &current_char, 1);
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 27\n");
+                }
+                // Check if buffer became full during character copy
+                if (o_batch_pos == O_BATCH_BUFFER_SIZE)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 28\n");
+                    break; // Stop copying this match if buffer full
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 28\n");
+                }
+                // fprintf(stderr, "[krep.c] exit print_matching_items 25\n");
+            }
+
+            // Check again if buffer became full during the loop
+            if (o_batch_pos == O_BATCH_BUFFER_SIZE)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 29\n");
+                // Flush here if needed, or let the outer loop handle it
+                continue; // Skip rest of processing for this match
+                // fprintf(stderr, "[krep.c] exit print_matching_items 29\n");
+            }
+
+            // 5. End color for match (if enabled)
+            if (color_output_enabled)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 30\n");
+                safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, color_reset, len_color_reset);
+                // fprintf(stderr, "[krep.c] exit print_matching_items 30\n");
+            }
+
+            // 6. Add newline (only if buffer not already full)
+            if (o_batch_pos < O_BATCH_BUFFER_SIZE)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 31\n");
+                safe_append_to_batch(&current_write_ptr, batch_buffer_end, &o_batch_pos, O_BATCH_BUFFER_SIZE, "\n", 1);
+                // fprintf(stderr, "[krep.c] exit print_matching_items 31\n");
+            }
+
+            // Update batch buffer position based on the actual data written
+            if (o_batch_pos != O_BATCH_BUFFER_SIZE)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 32\n");
+                o_batch_pos = current_write_ptr - o_batch_buffer;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 32\n");
+            }
+            items_printed_count++;
+            // fprintf(stderr, "[krep.c] exit print_matching_items 10\n");
+        }
+
+        // Flush any remaining content in the batch buffer
+        if (o_batch_pos > 0)
+        {
+            fprintf(stderr, "[krep.c] enter print_matching_items 33\n");
+            fwrite(o_batch_buffer, 1, o_batch_pos, stdout);
+            // fprintf(stderr, "[krep.c] exit print_matching_items 33\n");
+        }
+
+        // Free resources
+        if (newline_positions)
+        {
+            fprintf(stderr, "[krep.c] enter print_matching_items 34\n");
+            free(newline_positions);
+            // fprintf(stderr, "[krep.c] exit print_matching_items 34\n");
+        }
+        // fprintf(stderr, "[krep.c] exit print_matching_items 5\n");
+    }
+    // ========================================================================
+    // --- Mode: Full Lines (Default) ---
+    // ========================================================================
+    else
+    {
+        fprintf(stderr, "[krep.c] enter print_matching_items 35\n");
+        size_t last_printed_line_start = SIZE_MAX; // Track the start offset of the last line printed
+
+        // Precompute the filename prefix string (including colors if enabled)
+        char filename_prefix[PATH_MAX + 64] = ""; // Extra space for colors/separator
+        size_t filename_prefix_len = 0;
+        if (filename)
+        {
+            fprintf(stderr, "[krep.c] enter print_matching_items 36\n");
+            if (color_output_enabled)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 37\n");
+                // Full line starts with filename, separator, then text color
+                filename_prefix_len = snprintf(filename_prefix, sizeof(filename_prefix), "%s%s%s%s:%s",
+                                               color_filename, filename, color_reset, color_separator, color_text);
+                // fprintf(stderr, "[krep.c] exit print_matching_items 37\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 38\n");
+                filename_prefix_len = snprintf(filename_prefix, sizeof(filename_prefix), "%s:", filename);
+                // fprintf(stderr, "[krep.c] exit print_matching_items 38\n");
+            }
+
+            // Safety check on filename_prefix length
+            if (filename_prefix_len <= 0 || filename_prefix_len >= sizeof(filename_prefix))
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 39\n");
+                filename_prefix_len = (sizeof(filename_prefix) > 1) ? sizeof(filename_prefix) - 1 : 0;
+                if (filename_prefix_len > 0)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 40\n");
+                    filename_prefix[filename_prefix_len] = '\0';
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 40\n");
+                }
+                else
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 41\n");
+                    filename_prefix_len = 0;
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 41\n");
+                }
+                // fprintf(stderr, "[krep.c] exit print_matching_items 39\n");
+            }
+            // fprintf(stderr, "[krep.c] exit print_matching_items 36\n");
+        }
+
+// --- Create a line batch buffer for full line mode ---
+// This buffer aggregates multiple formatted lines before writing to stdout
+#define LINE_BATCH_BUFFER_SIZE (8 * 1024 * 1024) // 8MB for batch output
+        static char line_batch_buffer[LINE_BATCH_BUFFER_SIZE];
+        size_t line_batch_pos = 0;
+
+        // Iterate through matches, processing line by line
+        uint64_t i = 0;
+        while (i < result->count)
+        {
+            fprintf(stderr, "[krep.c] enter print_matching_items 42\n");
+            // Check max_count limit before processing each line
+            if (max_count != SIZE_MAX && items_printed_count >= max_count)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 43\n");
+                break; // Stop processing if limit is reached
+                // fprintf(stderr, "[krep.c] exit print_matching_items 43\n");
+            }
+
+            size_t first_match_start_on_line = result->positions[i].start_offset;
+
+            // Basic validation for the starting match offset
+            if (first_match_start_on_line >= text_len)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 44\n");
+                i++; // Skip invalid starting match
+                continue;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 44\n");
+            }
+
+            // Find the start of the line containing this match (optimization: use memrchr if available)
+            size_t line_start = find_line_start(text, text_len, first_match_start_on_line); // Use text instead of text_start
+
+            // Check if this line has already been printed in a previous iteration
+            if (line_start == last_printed_line_start)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 45\n");
+                // Efficiently skip all subsequent matches that start on this *same* line
+                // Find the end of the current line first
+                size_t current_line_end = find_line_end(text, text_len, line_start); // Use text instead of text_start
+                while (i < result->count && result->positions[i].start_offset < current_line_end)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 46\n");
+                    i++;
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 46\n");
+                }
+                continue; // Move to the next potential new line
+                // fprintf(stderr, "[krep.c] exit print_matching_items 45\n");
+            }
+
+            // Found a new line to process. Find its end boundary.
+            size_t line_end = find_line_end(text, text_len, line_start); // Use text instead of text_start
+
+            // --- Collect all matches that fall within this line ---
+            size_t line_match_count = 0;
+            uint64_t line_match_scan_idx = i; // Start scanning from the current match index
+
+            while (line_match_scan_idx < result->count)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 47\n");
+                size_t k_start = result->positions[line_match_scan_idx].start_offset;
+
+                // If the match starts at or after the end of the current line, we're done collecting for this line.
+                if (k_start >= line_end)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 48\n");
+                    break;
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 48\n");
+                }
+
+                // Only consider matches that start *on* this line
+                if (k_start >= line_start)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 49\n");
+                    // Ensure we don't overflow the preallocated line_match_positions buffer
+                    if (line_match_count < MAX_MATCHES_PER_LINE)
+                    {
+                        fprintf(stderr, "[krep.c] enter print_matching_items 50\n");
+                        size_t k_end = result->positions[line_match_scan_idx].end_offset;
+                        // Clamp match end to text length for safety
+                        if (k_end > text_len)
+                            k_end = text_len;
+
+                        // Store the match relative to the start of the text
+                        line_match_positions[line_match_count].start_offset = k_start;
+                        line_match_positions[line_match_count].end_offset = k_end;
+                        line_match_count++;
+                        // fprintf(stderr, "[krep.c] exit print_matching_items 50\n");
+                    }
+                    else
+                    {
+                        fprintf(stderr, "[krep.c] enter print_matching_items 51\n");
+                        // Log warning if too many matches on one line
+                        fprintf(stderr, "Warning: Exceeded MAX_MATCHES_PER_LINE (%d) on line starting at offset %zu in %s\n",
+                                MAX_MATCHES_PER_LINE, line_start, filename ? filename : "<stdin>");
+                        // Stop collecting matches for this line, but process the ones found so far
+                        break;
+                        // fprintf(stderr, "[krep.c] exit print_matching_items 51\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 49\n");
+                }
+
+                line_match_scan_idx++; // Move to the next potential match
+                // fprintf(stderr, "[krep.c] exit print_matching_items 47\n");
+            }
+
+            // --- Pre-calculate required buffer size for the line ---
+            size_t line_len = line_end - line_start;
+            size_t max_required_size = filename_prefix_len + line_len + 1; // Prefix + content + newline
+            if (color_output_enabled)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 52\n");
+                // Add space for color codes:
+                // - Initial text color (if no prefix)
+                // - Match color + text color for each match
+                // - Final reset color
+                max_required_size += (filename_prefix_len == 0 ? len_color_text : 0) +
+                                     (line_match_count * (len_color_match + len_color_text)) +
+                                     len_color_reset;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 52\n");
+            }
+
+            // --- Ensure line buffer capacity once ---
+            if (!ensure_line_buffer_capacity((char **)&line_buffer, &line_buffer_capacity, 0, max_required_size))
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 53\n");
+                // Handle error: cannot allocate enough buffer space for the line
+                fprintf(stderr, "Error: Failed to ensure sufficient buffer capacity (%zu bytes) for line starting at offset %zu in %s\n",
+                        max_required_size, line_start, filename ? filename : "<stdin>");
+                // Skip processing this line and advance past its matches
+                i = line_match_scan_idx;
+                continue;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 53\n");
+            }
+
+            // --- Format the current line with highlighting ---
+            size_t buffer_pos = 0;                 // Current position in line_buffer
+            char *current_write_ptr = line_buffer; // Use a direct pointer
+
+            // Add filename prefix if applicable
+            if (filename_prefix_len > 0)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 54\n");
+                memcpy(current_write_ptr, filename_prefix, filename_prefix_len);
+                current_write_ptr += filename_prefix_len;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 54\n");
+            }
+            else if (color_output_enabled)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 55\n");
+                // If no filename, but color is on, start the line with the default text color
+                memcpy(current_write_ptr, color_text, len_color_text);
+                current_write_ptr += len_color_text;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 55\n");
+            }
+
+            // Iterate through the line, copying text segments and highlighted matches
+            size_t current_pos_on_line = line_start; // Track position within the original text
+            for (size_t k = 0; k < line_match_count; ++k)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 56\n");
+                size_t k_start = line_match_positions[k].start_offset;
+                size_t k_end = line_match_positions[k].end_offset;
+
+                // Clamp match boundaries strictly to the current line's boundaries
+                if (k_start < line_start)
+                    k_start = line_start;
+                if (k_end > line_end)
+                    k_end = line_end;
+                if (k_start >= k_end)
+                    continue; // Skip zero-length or invalid matches
+
+                // 1. Copy text segment BEFORE the current match
+                if (k_start > current_pos_on_line)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 57\n");
+                    size_t len_before = k_start - current_pos_on_line;
+                    memcpy(current_write_ptr, text + current_pos_on_line, len_before);
+                    current_write_ptr += len_before;
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 57\n");
+                }
+
+                // 2. Copy the highlighted MATCH segment
+                size_t match_len = k_end - k_start;
+                if (color_output_enabled)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 58\n");
+                    memcpy(current_write_ptr, color_match, len_color_match);
+                    current_write_ptr += len_color_match;
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 58\n");
+                }
+                memcpy(current_write_ptr, text + k_start, match_len);
+                current_write_ptr += match_len;
+                if (color_output_enabled)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 59\n");
+                    memcpy(current_write_ptr, color_text, len_color_text); // Switch back to text color after match
+                    current_write_ptr += len_color_text;
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 59\n");
+                }
+
+                // Update the position marker within the original text line
+                current_pos_on_line = k_end;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 56\n");
+            }
+
+            // 3. Copy any remaining text AFTER the last match until the line end
+            if (current_pos_on_line < line_end)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 60\n");
+                size_t len_after = line_end - current_pos_on_line;
+                memcpy(current_write_ptr, text + current_pos_on_line, len_after);
+                current_write_ptr += len_after;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 60\n");
+            }
+
+            // 4. Add final color reset and newline character
+            if (color_output_enabled)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 61\n");
+                memcpy(current_write_ptr, color_reset, len_color_reset);
+                current_write_ptr += len_color_reset;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 61\n");
+            }
+            *current_write_ptr = '\n';
+            current_write_ptr++;
+
+            // Calculate final buffer position based on pointer arithmetic
+            buffer_pos = current_write_ptr - line_buffer;
+
+            // --- Efficient batch output handling ---
+            // Check if the newly formatted line fits in the batch buffer
+            if (line_batch_pos + buffer_pos > LINE_BATCH_BUFFER_SIZE)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 62\n");
+                // Flush the current batch buffer before adding the new line
+                if (fwrite(line_batch_buffer, 1, line_batch_pos, stdout) != line_batch_pos)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 63\n");
+                    perror("Error writing line batch buffer to stdout");
+                    // Consider how to handle this error; maybe stop processing?
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 63\n");
+                }
+                line_batch_pos = 0; // Reset batch buffer position
+                // fprintf(stderr, "[krep.c] exit print_matching_items 62\n");
+            }
+
+            // Copy formatted line to batch buffer (only if it fits after potential flush)
+            // This check prevents buffer overflow if a single line exceeds LINE_BATCH_BUFFER_SIZE
+            if (buffer_pos <= LINE_BATCH_BUFFER_SIZE)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 64\n");
+                memcpy(line_batch_buffer + line_batch_pos, line_buffer, buffer_pos);
+                line_batch_pos += buffer_pos;
+                // fprintf(stderr, "[krep.c] exit print_matching_items 64\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 65\n");
+                // If a single line is too large, write it directly (or handle error)
+                fprintf(stderr, "Warning: Single line exceeds batch buffer size (%zu > %d). Writing directly.\n",
+                        buffer_pos, LINE_BATCH_BUFFER_SIZE);
+                if (fwrite(line_buffer, 1, buffer_pos, stdout) != buffer_pos)
+                {
+                    fprintf(stderr, "[krep.c] enter print_matching_items 66\n");
+                    perror("Error writing oversized line directly to stdout");
+                    // fprintf(stderr, "[krep.c] exit print_matching_items 66\n");
+                }
+                // fprintf(stderr, "[krep.c] exit print_matching_items 65\n");
+            }
+
+            // Update tracking variables
+            items_printed_count++;                // Increment after successfully printing/batching a line
+            last_printed_line_start = line_start; // Mark this line as printed
+
+            // Advance the main loop index 'i' past all matches processed for this line
+            i = line_match_scan_idx;
+            continue; // Continue to the next potential line
+            // fprintf(stderr, "[krep.c] exit print_matching_items 42\n");
+        }
+
+        // Flush any remaining content in the line batch buffer
+        if (line_batch_pos > 0)
+        {
+            fprintf(stderr, "[krep.c] enter print_matching_items 67\n");
+            if (fwrite(line_batch_buffer, 1, line_batch_pos, stdout) != line_batch_pos)
+            {
+                fprintf(stderr, "[krep.c] enter print_matching_items 68\n");
+                perror("Error writing final line batch buffer to stdout");
+                // fprintf(stderr, "[krep.c] exit print_matching_items 68\n");
+            }
+            // fprintf(stderr, "[krep.c] exit print_matching_items 67\n");
+        }
+        // fprintf(stderr, "[krep.c] exit print_matching_items 35\n");
+    }
+
+    // --- Cleanup ---
+    fprintf(stderr, "[krep.c] enter print_matching_items 69\n");
+    fflush(stdout);
+    free(line_buffer);
+
+    return items_printed_count;
+    // fprintf(stderr, "[krep.c] exit print_matching_items 69\n");
+}
+
+// --- Utility Functions ---
+
+// Helper function to ensure a buffer has enough capacity, reallocating if needed.
+// Returns true on success, false on allocation failure.
+static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr, size_t current_pos, size_t needed)
+{
+    fprintf(stderr, "[krep.c] enter ensure_line_buffer_capacity 1\n");
+    if (current_pos + needed > *capacity_ptr)
+    {
+        fprintf(stderr, "[krep.c] enter ensure_line_buffer_capacity 2\n");
+        size_t new_capacity = *capacity_ptr;
+        if (new_capacity == 0)
+        {
+            fprintf(stderr, "[krep.c] enter ensure_line_buffer_capacity 3\n");
+            new_capacity = 1024; // Start with a reasonable size
+            // fprintf(stderr, "[krep.c] exit ensure_line_buffer_capacity 3\n");
+        }
+        // Double the capacity until it's large enough
+        while (new_capacity < current_pos + needed)
+        {
+            fprintf(stderr, "[krep.c] enter ensure_line_buffer_capacity 4\n");
+            // Check for potential overflow before doubling
+            if (new_capacity > SIZE_MAX / 2)
+            {
+                fprintf(stderr, "[krep.c] enter ensure_line_buffer_capacity 5\n");
+                // If doubling would overflow, try setting to the exact needed size + some buffer
+                // This is a last resort and might still fail if needed is too large
+                new_capacity = current_pos + needed + 1024;
+                if (new_capacity < current_pos + needed)
+                { // Check overflow again
+                    fprintf(stderr, "[krep.c] enter ensure_line_buffer_capacity 6\n");
+                    fprintf(stderr, "Error: Cannot allocate required buffer capacity (overflow).\n");
+                    return false;
+                    // fprintf(stderr, "[krep.c] exit ensure_line_buffer_capacity 6\n");
+                }
+                break; // Exit loop after setting to required size
+                // fprintf(stderr, "[krep.c] exit ensure_line_buffer_capacity 5\n");
+            }
+            new_capacity *= 2;
+            // fprintf(stderr, "[krep.c] exit ensure_line_buffer_capacity 4\n");
+        }
+
+        char *new_buffer = realloc(*buffer_ptr, new_capacity);
+        if (!new_buffer)
+        {
+            fprintf(stderr, "[krep.c] enter ensure_line_buffer_capacity 7\n");
+            perror("realloc failed for buffer");
+            return false;
+            // fprintf(stderr, "[krep.c] exit ensure_line_buffer_capacity 7\n");
+        }
+        *buffer_ptr = new_buffer;
+        *capacity_ptr = new_capacity;
+        // fprintf(stderr, "[krep.c] exit ensure_line_buffer_capacity 2\n");
+    }
+    return true;
+    // fprintf(stderr, "[krep.c] exit ensure_line_buffer_capacity 1\n");
+}
+
+// Get monotonic time
+double get_time(void)
+{
+    fprintf(stderr, "[krep.c] enter get_time 1\n");
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    {
+        fprintf(stderr, "[krep.c] enter get_time 2\n");
+        perror("Cannot get monotonic time");
+        return 0.0;
+        // fprintf(stderr, "[krep.c] exit get_time 2\n");
+    }
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    // fprintf(stderr, "[krep.c] exit get_time 1\n");
+}
+
+// Print usage information
+void print_usage(const char *program_name)
+{
+    fprintf(stderr, "[krep.c] enter print_usage 1\n");
+    printf("krep v%s - A high-performance string search utility (Optimized)\n\n", VERSION);
+    printf("Usage: %s [OPTIONS] PATTERN [FILE | DIRECTORY]\n", program_name);
+    printf("   or: %s [OPTIONS] -e PATTERN [-e PATTERN...] [FILE | DIRECTORY]\n", program_name);
+    printf("   or: %s [OPTIONS] -f FILE [FILE | DIRECTORY]\n", program_name);
+    printf("   or: %s [OPTIONS] -s PATTERN STRING_TO_SEARCH\n", program_name);
+    printf("   or: %s [OPTIONS] PATTERN < FILE\n", program_name);
+    printf("   or: cat FILE | %s [OPTIONS] PATTERN\n\n", program_name);
+    printf("OPTIONS:\n");
+    printf("  -i             Perform case-insensitive matching.\n");
+    printf("  -c             Count matching lines. Only a count of lines is printed.\n");
+    printf("  -o             Only matching. Print only the matched parts of lines, one per line.\n");
+    printf("  -e PATTERN     Specify pattern. Can be used multiple times (treated as OR for literal, combined for regex).\n");
+    printf("  -f FILE        Read patterns from FILE, one per line.\n");
+    printf("  -E             Interpret PATTERN(s) as POSIX Extended Regular Expression(s).\n");
+    printf("                 If multiple -e used with -E, they are combined with '|'.\n");
+    printf("  -F             Interpret PATTERN(s) as fixed strings (literal). Default if not -E.\n");
+    printf("  -r             Search directories recursively. Skips binary files and common dirs.\n");
+    printf("  -t NUM         Use NUM threads for file search (default: auto-detect cores).\n");
+    printf("  -s             Search in STRING_TO_SEARCH instead of FILE or DIRECTORY.\n");
+    printf("  --color[=WHEN] Control color output ('always', 'never', 'auto'). Default: 'auto'.\n");
+    printf("  --no-simd      Explicitly disable SIMD acceleration.\n");
+    printf("  -v             Show version information and exit.\n");
+    printf("  -h, --help     Show this help message and exit.\n");
+    printf("  -m NUM         Stop reading a file after NUM matching lines.\n");
+    printf("  -w             Select only matches that form whole words.\n\n");
+    printf("EXIT STATUS:\n");
+    printf("  0 if matches were found,\n");
+    printf("  1 if no matches were found,\n");
+    printf("  2 if an error occurred.\n\n");
+    printf("EXAMPLES:\n");
+    printf("  %s \"search term\" input.log\n", program_name);
+    printf("  %s -i -c ERROR large_log.txt\n", program_name);
+    printf("  %s -t 8 -o '[0-9]+' data.log | sort | uniq -c\n", program_name);
+    printf("  %s -E \"^[Ee]rror: .*failed\" system.log\n", program_name);
+    printf("  %s -r \"MyClass\" /path/to/project\n", program_name);
+    printf("  %s -e Error -e Warning app.log\n", program_name); // Find lines with Error OR Warning
+    // fprintf(stderr, "[krep.c] exit print_usage 1\n");
+}
+
+// Helper for case-insensitive comparison using the lookup table
+inline bool memory_equals_case_insensitive(const unsigned char *s1, const unsigned char *s2, size_t n)
+{
+    fprintf(stderr, "[krep.c] enter memory_equals_case_insensitive 1\n");
+    for (size_t i = 0; i < n; ++i)
+    {
+        fprintf(stderr, "[krep.c] enter memory_equals_case_insensitive 2\n");
+        if (lower_table[s1[i]] != lower_table[s2[i]])
+        {
+            fprintf(stderr, "[krep.c] enter memory_equals_case_insensitive 3\n");
+            return false;
+            // fprintf(stderr, "[krep.c] exit memory_equals_case_insensitive 3\n");
+        }
+        // fprintf(stderr, "[krep.c] exit memory_equals_case_insensitive 2\n");
+    }
+    return true;
+    // fprintf(stderr, "[krep.c] exit memory_equals_case_insensitive 1\n");
+}
+
+// --- Boyer-Moore-Horspool Algorithm ---
+
+// Prepare the bad character table for BMH
+void prepare_bad_char_table(const unsigned char *pattern, size_t pattern_len, int *bad_char_table, bool case_sensitive)
+{
+    fprintf(stderr, "[krep.c] enter prepare_bad_char_table 1\n");
+    // Initialize all shifts to pattern length
+    for (int i = 0; i < 256; i++)
+    {
+        fprintf(stderr, "[krep.c] enter prepare_bad_char_table 2\n");
+        bad_char_table[i] = (int)pattern_len;
+        // fprintf(stderr, "[krep.c] exit prepare_bad_char_table 2\n");
+    }
+    // Calculate shifts for characters actually in the pattern (excluding the last character)
+    // The shift is the distance from the end of the pattern.
+    for (size_t i = 0; i < pattern_len - 1; i++)
+    {
+        fprintf(stderr, "[krep.c] enter prepare_bad_char_table 3\n");
+        unsigned char c = pattern[i];
+        int shift = (int)(pattern_len - 1 - i);
+        if (!case_sensitive)
+        {
+            fprintf(stderr, "[krep.c] enter prepare_bad_char_table 4\n");
+            unsigned char lc = lower_table[c];
+            // Set the minimum shift for this character (rightmost occurrence determines shift)
+            if (shift < bad_char_table[lc])
+            {
+                fprintf(stderr, "[krep.c] enter prepare_bad_char_table 5\n");
+                bad_char_table[lc] = shift;
+                // fprintf(stderr, "[krep.c] exit prepare_bad_char_table 5\n");
+            }
+            // Also set for the uppercase equivalent if different
+            unsigned char uc = toupper(c); // Use standard toupper for the other case
+            if (uc != lc)
+            {
+                fprintf(stderr, "[krep.c] enter prepare_bad_char_table 6\n");
+                if (shift < bad_char_table[uc])
+                {
+                    fprintf(stderr, "[krep.c] enter prepare_bad_char_table 7\n");
+                    bad_char_table[uc] = shift;
+                    // fprintf(stderr, "[krep.c] exit prepare_bad_char_table 7\n");
+                }
+                // fprintf(stderr, "[krep.c] exit prepare_bad_char_table 6\n");
+            }
+            // fprintf(stderr, "[krep.c] exit prepare_bad_char_table 4\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter prepare_bad_char_table 8\n");
+            // Set the minimum shift
+            if (shift < bad_char_table[c])
+            {
+                fprintf(stderr, "[krep.c] enter prepare_bad_char_table 9\n");
+                bad_char_table[c] = shift;
+                // fprintf(stderr, "[krep.c] exit prepare_bad_char_table 9\n");
+            }
+            // fprintf(stderr, "[krep.c] exit prepare_bad_char_table 8\n");
+        }
+        // fprintf(stderr, "[krep.c] exit prepare_bad_char_table 3\n");
+    }
+    // fprintf(stderr, "[krep.c] exit prepare_bad_char_table 1\n");
+}
+// Adds positions to 'result' if params->track_positions is true.
+uint64_t boyer_moore_search(const search_params_t *params,
+                            const char *text_start,
+                            size_t text_len,
+                            match_result_t *result) // For position tracking (can be NULL)
+{
+    fprintf(stderr, "[krep.c] enter boyer_moore_search 1\n");
+    // --- Add max_count == 0 check ---
+    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
+        return 0;
+    // --- End add ---
+    // fprintf(stderr, "[krep.c] exit boyer_moore_search 1\n");
+
+    fprintf(stderr, "[krep.c] enter boyer_moore_search 2\n");
+    const unsigned char *utext_start = (const unsigned char *)text_start;
+    const unsigned char *search_pattern = (const unsigned char *)params->pattern;
+    size_t pattern_len = params->pattern_len;
+    bool case_sensitive = params->case_sensitive;
+    bool count_lines_mode = params->count_lines_mode;
+    bool track_positions = params->track_positions;
+    size_t max_count = params->max_count;
+
+    if (pattern_len == 0 || text_len < pattern_len)
+        return 0;
+    // fprintf(stderr, "[krep.c] exit boyer_moore_search 2\n");
+
+    fprintf(stderr, "[krep.c] enter boyer_moore_search 3\n");
+    int bad_char_table[256];
+    prepare_bad_char_table(search_pattern, pattern_len, bad_char_table, case_sensitive);
+
+    uint64_t current_count = 0;
+    size_t last_counted_line_start = SIZE_MAX;
+    size_t i = 0;
+    size_t search_limit = text_len - pattern_len + 1;
+
+    // Hoist pattern's last char once
+    unsigned char pc_last = search_pattern[pattern_len - 1];
+    // fprintf(stderr, "[krep.c] exit boyer_moore_search 3\n");
+
+    while (i < search_limit)
+    {
+        fprintf(stderr, "[krep.c] enter boyer_moore_search 4\n");
+        unsigned char tc_last = utext_start[i + pattern_len - 1];
+
+        bool last_char_match = case_sensitive
+                                   ? (tc_last == pc_last)
+                                   : (lower_table[tc_last] == lower_table[pc_last]);
+        // fprintf(stderr, "[krep.c] exit boyer_moore_search 4\n");
+
+        if (last_char_match)
+        {
+            fprintf(stderr, "[krep.c] enter boyer_moore_search 5\n");
+            bool full_match = true;
+            if (pattern_len > 1)
+            {
+                if (case_sensitive)
+                {
+                    fprintf(stderr, "[krep.c] enter boyer_moore_search 6\n");
+                    full_match = (memcmp(utext_start + i, search_pattern, pattern_len - 1) == 0);
+                    // fprintf(stderr, "[krep.c] exit boyer_moore_search 6\n");
+                }
+                else
+                {
+                    fprintf(stderr, "[krep.c] enter boyer_moore_search 7\n");
+                    full_match = memory_equals_case_insensitive(utext_start + i, search_pattern, pattern_len - 1);
+                    // fprintf(stderr, "[krep.c] exit boyer_moore_search 7\n");
+                }
+            }
+            // fprintf(stderr, "[krep.c] exit boyer_moore_search 5\n");
+
+            if (full_match)
+            {
+                fprintf(stderr, "[krep.c] enter boyer_moore_search 8\n");
+                // Whole word check
+                if (params->whole_word && !is_whole_word_match(text_start, text_len, i, i + pattern_len))
+                {
+                    fprintf(stderr, "[krep.c] enter boyer_moore_search 9\n");
+                    unsigned char bad = tc_last;
+                    int shift_val = bad_char_table[bad];
+                    i += shift_val;
+                    continue;
+                    // fprintf(stderr, "[krep.c] exit boyer_moore_search 9\n");
+                }
+                bool count_incremented_this_match = false;
+                if (count_lines_mode)
+                {
+                    fprintf(stderr, "[krep.c] enter boyer_moore_search 10\n");
+                    size_t line_start = find_line_start(text_start, text_len, i);
+                    if (line_start != last_counted_line_start)
+                    {
+                        fprintf(stderr, "[krep.c] enter boyer_moore_search 11\n");
+                        current_count++;
+                        last_counted_line_start = line_start;
+                        count_incremented_this_match = true;
+                        // fprintf(stderr, "[krep.c] exit boyer_moore_search 11\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit boyer_moore_search 10\n");
+                }
+                else
+                {
+                    fprintf(stderr, "[krep.c] enter boyer_moore_search 12\n");
+                    current_count++;
+                    count_incremented_this_match = true;
+                    if (track_positions && result && current_count <= max_count)
+                    {
+                        fprintf(stderr, "[krep.c] enter boyer_moore_search 13\n");
+                        if (!match_result_add(result, i, i + pattern_len))
+                        {
+                            fprintf(stderr, "[krep.c] enter boyer_moore_search 14\n");
+                            // Warning: allocation failed, ignore location
+                            // fprintf(stderr, "[krep.c] exit boyer_moore_search 14\n");
+                        }
+                        // fprintf(stderr, "[krep.c] exit boyer_moore_search 13\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit boyer_moore_search 12\n");
+                }
+
+                if (count_incremented_this_match && current_count >= max_count)
+                {
+                    fprintf(stderr, "[krep.c] enter boyer_moore_search 15\n");
+                    break;
+                    // fprintf(stderr, "[krep.c] exit boyer_moore_search 15\n");
+                }
+
+                fprintf(stderr, "[krep.c] enter boyer_moore_search 16\n");
+                unsigned char bad = tc_last;
+                int shift_val = bad_char_table[bad];
+                if (only_matching && !params->count_lines_mode)
+                    i += pattern_len;
+                else
+                    i += shift_val;
+                continue;
+                // fprintf(stderr, "[krep.c] exit boyer_moore_search 16\n");
+            }
+            // fprintf(stderr, "[krep.c] exit boyer_moore_search 8\n");
+        }
+
+        fprintf(stderr, "[krep.c] enter boyer_moore_search 17\n");
+        unsigned char bad = tc_last;
+        int shift_val = bad_char_table[bad];
+        i += shift_val;
+        // fprintf(stderr, "[krep.c] exit boyer_moore_search 17\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter boyer_moore_search 18\n");
+    return current_count;
+    // fprintf(stderr, "[krep.c] exit boyer_moore_search 18\n");
+}
+
+// --- Regex Search ---
+
+uint64_t regex_search(const search_params_t *params,
+                      const char *text_start,
+                      size_t text_len,
+                      match_result_t *result)
+{
+    fprintf(stderr, "[krep.c] enter regex_search 1\n");
+    // 1) If limit is zero, no matches.
+    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions)) // Check both modes
+        return 0;
+    // fprintf(stderr, "[krep.c] exit regex_search 1\n");
+
+    fprintf(stderr, "[krep.c] enter regex_search 2\n");
+    // Must have a compiled regex.
+    if (!params->compiled_regex)
+        return 0;
+    // fprintf(stderr, "[krep.c] exit regex_search 2\n");
+
+    fprintf(stderr, "[krep.c] enter regex_search 3\n");
+    // Special‐case empty haystack: allow zero‐length match like ^$
+    if (text_len == 0)
+    {
+        fprintf(stderr, "[krep.c] enter regex_search 4\n");
+        regmatch_t m;
+        if (regexec(params->compiled_regex, "", 1, &m, 0) == 0)
+        {
+            fprintf(stderr, "[krep.c] enter regex_search 5\n");
+            // count‐lines vs track_positions
+            if (params->count_lines_mode)
+                return 1;
+            if (params->track_positions && result)
+                match_result_add(result, 0, 0);
+            return 1;
+            // fprintf(stderr, "[krep.c] exit regex_search 5\n");
+        }
+        return 0;
+        // fprintf(stderr, "[krep.c] exit regex_search 4\n");
+    }
+    // fprintf(stderr, "[krep.c] exit regex_search 3\n");
+
+    fprintf(stderr, "[krep.c] enter regex_search 6\n");
+    const regex_t *regex = params->compiled_regex;
+    regmatch_t pmatch[1];
+    int base_eflags = REG_STARTEND | REG_NEWLINE | (params->case_sensitive ? 0 : REG_ICASE);
+    const char *cur = text_start;
+    size_t rem = text_len;
+    size_t last_line = SIZE_MAX;
+    uint64_t count = 0;
+    size_t max_count = params->max_count; // Get max_count
+    // fprintf(stderr, "[krep.c] exit regex_search 6\n");
+
+    while (rem > 0 || (rem == 0 && cur == text_start)) // Allow one check for empty string match
+    {
+        fprintf(stderr, "[krep.c] enter regex_search 7\n");
+        // Ensure we don't search past the end if rem becomes 0 mid-loop
+        if (rem == 0 && cur != text_start)
+            break;
+        // fprintf(stderr, "[krep.c] exit regex_search 7\n");
+
+        fprintf(stderr, "[krep.c] enter regex_search 8\n");
+        pmatch[0].rm_so = 0;
+        pmatch[0].rm_eo = rem; // Search up to the remaining length
+        // REG_NOTBOL is set if we are not at the absolute start of the original text
+        int eflags = base_eflags | ((cur == text_start) ? 0 : REG_NOTBOL);
+
+        int rc = regexec(regex, cur, 1, pmatch, eflags);
+        // fprintf(stderr, "[krep.c] exit regex_search 8\n");
+
+        if (rc != 0)
+        {
+            fprintf(stderr, "[krep.c] enter regex_search 9\n");
+            if (rc == REG_NOMATCH)
+            {
+                fprintf(stderr, "[krep.c] enter regex_search 10\n");
+                break; // No more matches found
+                // fprintf(stderr, "[krep.c] exit regex_search 10\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter regex_search 11\n");
+                // Handle regex execution error
+                char ebuf[256];
+                regerror(rc, regex, ebuf, sizeof(ebuf));
+                fprintf(stderr, "krep: Regex execution error: %s\n", ebuf);
+                // Consider returning an error indicator or specific count
+                return count; // Return count found so far on error
+                // fprintf(stderr, "[krep.c] exit regex_search 11\n");
+            }
+            // fprintf(stderr, "[krep.c] exit regex_search 9\n");
+        }
+
+        fprintf(stderr, "[krep.c] enter regex_search 12\n");
+        // Check for -1 offsets which indicate failure (shouldn't happen if rc == 0)
+        if (pmatch[0].rm_so == -1 || pmatch[0].rm_eo == -1)
+        {
+            fprintf(stderr, "[krep.c] enter regex_search 13\n");
+            fprintf(stderr, "krep: Warning: regexec returned success but invalid offsets.\n");
+            break; // Treat as no match / error
+            // fprintf(stderr, "[krep.c] exit regex_search 13\n");
+        }
+        // fprintf(stderr, "[krep.c] exit regex_search 12\n");
+
+        fprintf(stderr, "[krep.c] enter regex_search 14\n");
+        size_t so = pmatch[0].rm_so; // Offset relative to 'cur'
+        size_t eo = pmatch[0].rm_eo; // Offset relative to 'cur'
+
+        // Ensure eo >= so (sanity check)
+        if (eo < so)
+        {
+            fprintf(stderr, "[krep.c] enter regex_search 15\n");
+            fprintf(stderr, "krep: Warning: regexec returned eo < so.\n");
+            // Advance past this point to avoid infinite loop
+            size_t adv = 1;
+            if (cur + adv > text_start + text_len)
+                break; // Don't go past end
+            cur += adv;
+            rem = (text_start + text_len) - cur; // Recalculate remaining
+            continue;
+            // fprintf(stderr, "[krep.c] exit regex_search 15\n");
+        }
+        // fprintf(stderr, "[krep.c] exit regex_search 14\n");
+
+        fprintf(stderr, "[krep.c] enter regex_search 16\n");
+        size_t start = (cur - text_start) + so; // Absolute start offset
+        size_t end = (cur - text_start) + eo;   // Absolute end offset
+
+        // Whole word check
+        if (params->whole_word && !is_whole_word_match(text_start, text_len, start, end))
+        {
+            fprintf(stderr, "[krep.c] enter regex_search 17\n");
+            // If whole word check fails, we need to advance past the start of this failed match
+            size_t adv = so + 1; // Advance at least one byte past the start
+            if (cur + adv > text_start + text_len)
+                break;
+            cur += adv;
+            rem = (text_start + text_len) - cur;
+            continue;
+            // fprintf(stderr, "[krep.c] exit regex_search 17\n");
+        }
+        // fprintf(stderr, "[krep.c] exit regex_search 16\n");
+
+        if (params->count_lines_mode)
+        {
+            fprintf(stderr, "[krep.c] enter regex_search 18\n");
+            size_t line_start = find_line_start(text_start, text_len, start);
+            if (line_start != last_line)
+            {
+                fprintf(stderr, "[krep.c] enter regex_search 19\n");
+                count++;
+                last_line = line_start;
+                // fprintf(stderr, "[krep.c] exit regex_search 19\n");
+            }
+            // fprintf(stderr, "[krep.c] exit regex_search 18\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter regex_search 20\n");
+            count++;
+            if (params->track_positions && result)
+            {
+                fprintf(stderr, "[krep.c] enter regex_search 21\n");
+                match_result_add(result, start, end);
+                // fprintf(stderr, "[krep.c] exit regex_search 21\n");
+            }
+            // fprintf(stderr, "[krep.c] exit regex_search 20\n");
+        }
+
+        fprintf(stderr, "[krep.c] enter regex_search 22\n");
+        // Check max_count limit
+        if (max_count != SIZE_MAX && count >= max_count)
+            break;
+        // fprintf(stderr, "[krep.c] exit regex_search 22\n");
+
+        fprintf(stderr, "[krep.c] enter regex_search 23\n");
+        // Advance logic: Start next search *after* the current match.
+        // If the match was zero-length, advance by one character to avoid infinite loop.
+        size_t adv = eo; // Advance to the end of the match relative to cur
+        if (so == eo)
+        {             // Zero-length match
+            adv += 1; // Advance by at least one character
+        }
+
+        // Ensure advancement doesn't exceed remaining buffer
+        if (adv == 0)
+        {            // Should only happen if eo=0 and so=0
+            adv = 1; // Force advance by 1 if match is at start and zero-length
+        }
+
+        if (adv > rem)
+        {          // Should not happen if eo <= rem
+            break; // Cannot advance further
+        }
+
+        // Check if advancing goes beyond the original text length
+        if (cur + adv > text_start + text_len)
+        {
+            break;
+        }
+
+        cur += adv;
+        // Recalculate remaining length based on the new 'cur' position
+        rem = (text_start + text_len) - cur;
+
+        // Break if we advanced past the end (safety)
+        if (cur > text_start + text_len)
+        {
+            break;
+        }
+
+        // Handle potential edge case for empty string match at the very end
+        if (cur == text_start + text_len && rem == 0 && so == eo && start == text_len)
+        {
+            // If we found a zero-length match exactly at the end, stop.
+            break;
+        }
+        // fprintf(stderr, "[krep.c] exit regex_search 23\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter regex_search 24\n");
+    return count;
+    // fprintf(stderr, "[krep.c] exit regex_search 24\n");
+}
+
+// --- Knuth-Morris-Pratt (KMP) Algorithm ---
+
+// Compute the Longest Proper Prefix which is also Suffix (LPS) array
+// lps[i] = length of the longest proper prefix of pattern[0..i] which is also a suffix of pattern[0..i]
+static void compute_lps_array(const unsigned char *pattern, size_t pattern_len, int *lps, bool case_sensitive)
+{
+    fprintf(stderr, "[krep.c] enter compute_lps_array 1\n");
+    size_t length = 0; // length of the previous longest prefix suffix
+    lps[0] = 0;        // lps[0] is always 0
+    size_t i = 1;
+    // fprintf(stderr, "[krep.c] exit compute_lps_array 1\n");
+
+    // Calculate lps[i] for i = 1 to pattern_len-1
+    while (i < pattern_len)
+    {
+        fprintf(stderr, "[krep.c] enter compute_lps_array 2\n");
+        // Compare pattern[i] with the character after the current prefix suffix (pattern[length])
+        unsigned char char_i = case_sensitive ? pattern[i] : lower_table[pattern[i]];
+        unsigned char char_len = case_sensitive ? pattern[length] : lower_table[pattern[length]];
+        // fprintf(stderr, "[krep.c] exit compute_lps_array 2\n");
+
+        if (char_i == char_len)
+        {
+            fprintf(stderr, "[krep.c] enter compute_lps_array 3\n");
+            // Match: extend the current prefix suffix length
+            length++;
+            lps[i] = length;
+            i++;
+            // fprintf(stderr, "[krep.c] exit compute_lps_array 3\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter compute_lps_array 4\n");
+            // Mismatch
+            if (length != 0)
+            {
+                fprintf(stderr, "[krep.c] enter compute_lps_array 5\n");
+                // Fall back using the LPS value of the previous character in the prefix suffix
+                // This allows us to reuse the previously computed information.
+                length = lps[length - 1];
+                // Do not increment i here, retry comparison with the new 'length'
+                // fprintf(stderr, "[krep.c] exit compute_lps_array 5\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter compute_lps_array 6\n");
+                // If length is 0, there's no prefix suffix ending here
+                lps[i] = 0;
+                i++; // Move to the next character
+                // fprintf(stderr, "[krep.c] exit compute_lps_array 6\n");
+            }
+            // fprintf(stderr, "[krep.c] exit compute_lps_array 4\n");
+        }
+    }
+}
+
+// KMP search function (Corrected advancement for overlaps)
+// Returns line count (-c) or match count (other modes).
+// Adds positions to 'result' if params->track_positions is true.
+uint64_t kmp_search(const search_params_t *params,
+                    const char *text_start,
+                    size_t text_len,
+                    match_result_t *result) // For position tracking (can be NULL)
+{
+    fprintf(stderr, "[krep.c] enter kmp_search 1\n");
+    // --- Add max_count == 0 check ---
+    if (params->max_count == 0)
+        return 0;
+    // --- End add ---
+    // fprintf(stderr, "[krep.c] exit kmp_search 1\n");
+
+    fprintf(stderr, "[krep.c] enter kmp_search 2\n");
+    uint64_t current_count = 0; // Use local counter for limit check
+    const unsigned char *search_pattern = (const unsigned char *)params->pattern;
+    size_t pattern_len = params->pattern_len;
+    bool case_sensitive = params->case_sensitive;
+    bool count_lines_mode = params->count_lines_mode;
+    bool track_positions = params->track_positions;
+    size_t max_count = params->max_count; // Get max_count
+
+    if (pattern_len == 0 || text_len < pattern_len)
+        return 0;
+    // fprintf(stderr, "[krep.c] exit kmp_search 2\n");
+
+    fprintf(stderr, "[krep.c] enter kmp_search 3\n");
+    // Precompute LPS array
+    int *lps = malloc(pattern_len * sizeof(int));
+    if (!lps)
+    {
+        perror("malloc failed for KMP LPS array");
+        return 0; // Indicate error or handle differently
+    }
+    compute_lps_array(search_pattern, pattern_len, lps, case_sensitive);
+    // fprintf(stderr, "[krep.c] exit kmp_search 3\n");
+
+    fprintf(stderr, "[krep.c] enter kmp_search 4\n");
+    size_t i = 0; // index for text_start[]
+    size_t j = 0; // index for search_pattern[]
+    const unsigned char *utext_start = (const unsigned char *)text_start;
+    size_t last_counted_line_start = SIZE_MAX; // For -c mode tracking
+    // fprintf(stderr, "[krep.c] exit kmp_search 4\n");
+
+    while (i < text_len)
+    {
+        fprintf(stderr, "[krep.c] enter kmp_search 5\n");
+        // Compare current characters (case-sensitive or insensitive)
+        unsigned char char_text = case_sensitive ? utext_start[i] : lower_table[utext_start[i]];
+        unsigned char char_patt = case_sensitive ? search_pattern[j] : lower_table[search_pattern[j]];
+        // fprintf(stderr, "[krep.c] exit kmp_search 5\n");
+
+        if (char_patt == char_text)
+        {
+            fprintf(stderr, "[krep.c] enter kmp_search 6\n");
+            // Match: advance both text and pattern indices
+            i++;
+            j++;
+            // fprintf(stderr, "[krep.c] exit kmp_search 6\n");
+        }
+
+        fprintf(stderr, "[krep.c] enter kmp_search 7\n");
+        // If pattern index 'j' reaches pattern_len, a full match is found
+        if (j == pattern_len)
+        {
+            fprintf(stderr, "[krep.c] enter kmp_search 8\n");
+            // Match found ending at index i-1, starting at i - j
+            size_t match_start_index = i - j;
+            // fprintf(stderr, "[krep.c] exit kmp_search 8\n");
+
+            fprintf(stderr, "[krep.c] enter kmp_search 9\n");
+            // --- Match Found ---
+            // Whole word check
+            if (params->whole_word && !is_whole_word_match(text_start, text_len, match_start_index, match_start_index + pattern_len))
+            {
+                fprintf(stderr, "[krep.c] enter kmp_search 10\n");
+                j = 0;
+                continue;
+                // fprintf(stderr, "[krep.c] exit kmp_search 10\n");
+            }
+            // fprintf(stderr, "[krep.c] exit kmp_search 9\n");
+
+            if (count_lines_mode) // -c mode
+            {
+                fprintf(stderr, "[krep.c] enter kmp_search 11\n");
+                size_t line_start = find_line_start(text_start, text_len, match_start_index);
+                if (line_start != last_counted_line_start)
+                {
+                    fprintf(stderr, "[krep.c] enter kmp_search 12\n");
+                    // --- Check max_count BEFORE incrementing ---
+                    if (max_count != SIZE_MAX && current_count >= max_count)
+                    {
+                        fprintf(stderr, "[krep.c] enter kmp_search 13\n");
+                        break; // Limit reached
+                        // fprintf(stderr, "[krep.c] exit kmp_search 13\n");
+                    }
+                    // --- End check ---
+                    // fprintf(stderr, "[krep.c] exit kmp_search 12\n");
+
+                    fprintf(stderr, "[krep.c] enter kmp_search 14\n");
+                    current_count++; // Increment line count
+                    last_counted_line_start = line_start;
+
+                    // Skip to end of current line (optimization for -c mode)
+                    size_t line_end = find_line_end(text_start, text_len, line_start);
+                    i = (line_end < text_len) ? line_end + 1 : text_len;
+                    j = 0;    // Reset pattern index
+                    continue; // Continue outer loop from the potentially advanced 'i'
+                    // fprintf(stderr, "[krep.c] exit kmp_search 14\n");
+                }
+                fprintf(stderr, "[krep.c] enter kmp_search 15\n");
+                // If match is on an already counted line, just update j and continue
+                j = 0;
+                // fprintf(stderr, "[krep.c] exit kmp_search 15\n");
+            }
+            else // Not -c mode (default, -o, or -co)
+            {
+                fprintf(stderr, "[krep.c] enter kmp_search 16\n");
+                // --- Check max_count BEFORE incrementing ---
+                if (max_count != SIZE_MAX && current_count >= max_count)
+                {
+                    fprintf(stderr, "[krep.c] enter kmp_search 17\n");
+                    if (track_positions && result) // Add final match
+                    {
+                        fprintf(stderr, "[krep.c] enter kmp_search 18\n");
+                        match_result_add(result, match_start_index, match_start_index + pattern_len);
+                        // fprintf(stderr, "[krep.c] exit kmp_search 18\n");
+                    }
+                    break; // Limit reached
+                    // fprintf(stderr, "[krep.c] exit kmp_search 17\n");
+                }
+                // --- End check ---
+                // fprintf(stderr, "[krep.c] exit kmp_search 16\n");
+
+                fprintf(stderr, "[krep.c] enter kmp_search 19\n");
+                current_count++; // Increment match count
+
+                if (track_positions && result) // If tracking positions (default or -o)
+                {
+                    fprintf(stderr, "[krep.c] enter kmp_search 20\n");
+                    // Add the match position without deduplication
+                    if (!match_result_add(result, match_start_index, match_start_index + pattern_len))
+                    {
+                        fprintf(stderr, "[krep.c] enter kmp_search 21\n");
+                        fprintf(stderr, "Warning: Failed to add match position (KMP).\n");
+                        // fprintf(stderr, "[krep.c] exit kmp_search 21\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit kmp_search 20\n");
+                }
+
+                // For pattern "11", we need to be more selective - advance by exactly the pattern
+                // length to match ripgrep's behavior (prevents finding "11" in "1111" at positions 0-1, 1-2, 2-3)
+                // The key insight is that for -o mode, we need non-overlapping matches
+                i = match_start_index + pattern_len; // This is the critical line - always advance by full pattern length
+                j = 0;                               // Reset pattern index
+                // fprintf(stderr, "[krep.c] exit kmp_search 19\n");
+            }
+            // fprintf(stderr, "[krep.c] exit kmp_search 11\n");
+        }
+        // Mismatch after j matches (or j == 0)
+        else if (i < text_len && char_patt != char_text)
+        {
+            fprintf(stderr, "[krep.c] enter kmp_search 22\n");
+            // If mismatch occurred after some initial match (j > 0),
+            // use the LPS array to shift the pattern appropriately.
+            // We don't need to compare characters pattern[0..lps[j-1]-1] again,
+            // as they will match anyway. Don't advance 'i'.
+            if (j != 0)
+            {
+                fprintf(stderr, "[krep.c] enter kmp_search 23\n");
+                j = lps[j - 1];
+                // fprintf(stderr, "[krep.c] exit kmp_search 23\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter kmp_search 24\n");
+                // If mismatch occurred at the first character (j == 0),
+                // simply advance the text index 'i'.
+                i++;
+                // fprintf(stderr, "[krep.c] exit kmp_search 24\n");
+            }
+            // fprintf(stderr, "[krep.c] exit kmp_search 22\n");
+        }
+        // fprintf(stderr, "[krep.c] exit kmp_search 7\n");
+    } // end while
+
+    fprintf(stderr, "[krep.c] enter kmp_search 25\n");
+    free(lps);            // Free the LPS array
+    return current_count; // Return line count or match count
+    // fprintf(stderr, "[krep.c] exit kmp_search 25\n");
+}
+
+// --- Search Orchestration ---
+
+search_func_t select_search_algorithm(const search_params_t *params)
+{
+    fprintf(stderr, "[krep.c] enter select_search_algorithm 1\n");
+    // Use regex search if requested
+    if (params->use_regex)
+    {
+        return regex_search;
+    }
+    // fprintf(stderr, "[krep.c] exit select_search_algorithm 1\n");
+
+    fprintf(stderr, "[krep.c] enter select_search_algorithm 2\n");
+    // Use Aho-Corasick for multiple literal patterns
+    if (params->num_patterns > 1 && !params->use_regex)
+    {
+        return aho_corasick_search;
+    }
+    // fprintf(stderr, "[krep.c] exit select_search_algorithm 2\n");
+
+    fprintf(stderr, "[krep.c] enter select_search_algorithm 3\n");
+    // --- Single Literal Pattern ---
+
+    // Check if SIMD can be used:
+    bool can_use_simd = !force_no_simd && SIMD_MAX_PATTERN_LEN > 0 && params->pattern_len <= SIMD_MAX_PATTERN_LEN;
+
+    // First, handle very short patterns (1-3 characters) specially
+    const size_t SHORT_PATTERN_THRESH = 4; // Patterns of length 1-3 use specialized algorithms
+
+    if (params->pattern_len == 1)
+    {
+        fprintf(stderr, "[krep.c] enter select_search_algorithm 4\n");
+        // For single-character patterns, use ultra-fast memchr approach
+        return memchr_search;
+        // fprintf(stderr, "[krep.c] exit select_search_algorithm 4\n");
+    }
+    else if (params->pattern_len < SHORT_PATTERN_THRESH)
+    {
+        fprintf(stderr, "[krep.c] enter select_search_algorithm 5\n");
+        // For 2-3 character patterns, use our specialized short pattern search
+        // SIMD might still be better for case-sensitive search on supported platforms
+        if (can_use_simd && params->case_sensitive)
+        {
+            fprintf(stderr, "[krep.c] enter select_search_algorithm 6\n");
+// Use SIMD for short case-sensitive patterns if available
+#if KREP_USE_AVX2
+            return simd_avx2_search;
+#elif KREP_USE_SSE42
+            return simd_sse42_search;
+#elif KREP_USE_NEON
+            return neon_search;
+#else
+            return memchr_short_search;
+#endif
+            // fprintf(stderr, "[krep.c] exit select_search_algorithm 6\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter select_search_algorithm 7\n");
+            // Use our specialized function for short patterns (handles case-insensitive well)
+            return memchr_short_search;
+            // fprintf(stderr, "[krep.c] exit select_search_algorithm 7\n");
+        }
+        // fprintf(stderr, "[krep.c] exit select_search_algorithm 5\n");
+    }
+    // fprintf(stderr, "[krep.c] exit select_search_algorithm 3\n");
+
+    fprintf(stderr, "[krep.c] enter select_search_algorithm 8\n");
+    // For patterns 4 characters or longer, follow existing logic
+    if (can_use_simd)
+    {
+#if KREP_USE_AVX2
+        fprintf(stderr, "[krep.c] enter select_search_algorithm 9\n");
+        // AVX2 supports case-insensitive up to 32 bytes
+        if (params->pattern_len <= 32)
+            return simd_avx2_search;
+        // fprintf(stderr, "[krep.c] exit select_search_algorithm 9\n");
+#endif
+#if KREP_USE_SSE42
+        fprintf(stderr, "[krep.c] enter select_search_algorithm 10\n");
+        // SSE4.2 only supports case-sensitive up to 16 bytes
+        if (params->pattern_len <= 16 && params->case_sensitive)
+            return simd_sse42_search;
+        // fprintf(stderr, "[krep.c] exit select_search_algorithm 10\n");
+#endif
+#if KREP_USE_NEON
+        fprintf(stderr, "[krep.c] enter select_search_algorithm 11\n");
+        // NEON only supports case-sensitive up to 16 bytes
+        if (params->pattern_len <= 16 && params->case_sensitive)
+            return neon_search;
+        // fprintf(stderr, "[krep.c] exit select_search_algorithm 11\n");
+#endif
+    }
+    // fprintf(stderr, "[krep.c] exit select_search_algorithm 8\n");
+
+    fprintf(stderr, "[krep.c] enter select_search_algorithm 12\n");
+    // Fallback to scalar algorithms for longer patterns
+    const size_t KMP_THRESH = 8; // Increased threshold - KMP becomes more efficient for certain patterns
+
+    if (params->pattern_len < KMP_THRESH && is_repetitive_pattern(params->pattern, params->pattern_len))
+    {
+        fprintf(stderr, "[krep.c] enter select_search_algorithm 13\n");
+        return kmp_search; // KMP is better for repetitive patterns
+        // fprintf(stderr, "[krep.c] exit select_search_algorithm 13\n");
+    }
+    else
+    {
+        fprintf(stderr, "[krep.c] enter select_search_algorithm 14\n");
+        return boyer_moore_search; // Generally best for most pattern types
+        // fprintf(stderr, "[krep.c] exit select_search_algorithm 14\n");
+    }
+    // fprintf(stderr, "[krep.c] exit select_search_algorithm 12\n");
+}
+
+// Helper function to detect repetitive patterns where KMP might perform better
+static bool is_repetitive_pattern(const char *pattern, size_t pattern_len)
+{
+    fprintf(stderr, "[krep.c] enter is_repetitive_pattern 1\n");
+    if (pattern_len < 3)
+        return false;
+    // fprintf(stderr, "[krep.c] exit is_repetitive_pattern 1\n");
+
+    fprintf(stderr, "[krep.c] enter is_repetitive_pattern 2\n");
+    // Look for repeating characters or short sequences
+    size_t repeats = 0;
+    char prev = pattern[0];
+
+    for (size_t i = 1; i < pattern_len; i++)
+    {
+        fprintf(stderr, "[krep.c] enter is_repetitive_pattern 3\n");
+        if (pattern[i] == prev)
+        {
+            fprintf(stderr, "[krep.c] enter is_repetitive_pattern 4\n");
+            repeats++;
+            if (repeats >= pattern_len / 2)
+                return true;
+            // fprintf(stderr, "[krep.c] exit is_repetitive_pattern 4\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter is_repetitive_pattern 5\n");
+            repeats = 0;
+            prev = pattern[i];
+            // fprintf(stderr, "[krep.c] exit is_repetitive_pattern 5\n");
+        }
+        // fprintf(stderr, "[krep.c] exit is_repetitive_pattern 3\n");
+    }
+    // fprintf(stderr, "[krep.c] exit is_repetitive_pattern 2\n");
+
+    fprintf(stderr, "[krep.c] enter is_repetitive_pattern 6\n");
+    // Check for short repeating sequences (ab, aba, abab, etc.)
+    for (size_t seq_len = 2; seq_len <= pattern_len / 2; seq_len++)
+    {
+        fprintf(stderr, "[krep.c] enter is_repetitive_pattern 7\n");
+        bool is_repetitive = true;
+        for (size_t i = seq_len; i < pattern_len; i++)
+        {
+            fprintf(stderr, "[krep.c] enter is_repetitive_pattern 8\n");
+            if (pattern[i] != pattern[i % seq_len])
+            {
+                fprintf(stderr, "[krep.c] enter is_repetitive_pattern 9\n");
+                is_repetitive = false;
+                break;
+                // fprintf(stderr, "[krep.c] exit is_repetitive_pattern 9\n");
+            }
+            // fprintf(stderr, "[krep.c] exit is_repetitive_pattern 8\n");
+        }
+        if (is_repetitive)
+            return true;
+        // fprintf(stderr, "[krep.c] exit is_repetitive_pattern 7\n");
+    }
+
+    return false;
+    // fprintf(stderr, "[krep.c] exit is_repetitive_pattern 6\n");
+}
+
+// --- Threading Logic ---
+
+// Function executed by each search thread (handles single or multiple patterns)
+void *search_chunk_thread(void *arg)
+{
+    fprintf(stderr, "[krep.c] enter search_chunk_thread 1\n");
+    thread_data_t *data = (thread_data_t *)arg;
+    match_result_t *local_result = NULL; // Local results if tracking positions
+    uint64_t count_result = 0;           // Line or match count
+    // fprintf(stderr, "[krep.c] exit search_chunk_thread 1\n");
+
+    fprintf(stderr, "[krep.c] enter search_chunk_thread 2\n");
+    // Allocate local result storage if tracking positions
+    if (data->params->track_positions)
+    {
+        fprintf(stderr, "[krep.c] enter search_chunk_thread 3\n");
+        // Estimate initial capacity based on chunk length
+        uint64_t initial_cap = (data->chunk_len / 1000 > 100) ? data->chunk_len / 1000 : 100;
+        local_result = match_result_init(initial_cap);
+        if (!local_result)
+        {
+            fprintf(stderr, "[krep.c] enter search_chunk_thread 4\n");
+            fprintf(stderr, "krep: Thread %d: Failed to allocate local match results.\n", data->thread_id);
+            data->error_flag = true;
+            return NULL; // Signal error
+            // fprintf(stderr, "[krep.c] exit search_chunk_thread 4\n");
+        }
+        data->local_result = local_result; // Store pointer for the main thread
+        // fprintf(stderr, "[krep.c] exit search_chunk_thread 3\n");
+    }
+    // fprintf(stderr, "[krep.c] exit search_chunk_thread 2\n");
+
+    fprintf(stderr, "[krep.c] enter search_chunk_thread 5\n");
+    // Select and run the search algorithm on the assigned chunk
+    // Pass local_result (can be NULL if not tracking positions)
+    // For multiple patterns, select_search_algorithm should return aho_corasick_search
+    search_func_t search_algo = select_search_algorithm(data->params);
+
+    count_result = search_algo(data->params,
+                               data->chunk_start,
+                               data->chunk_len,
+                               local_result); // Pass NULL if track_positions is false
+
+    // Store the count (lines or matches) found by this thread
+    data->count_result = count_result;
+
+    return NULL; // Success
+    // fprintf(stderr, "[krep.c] exit search_chunk_thread 5\n");
+}
+
+// --- Public API Implementations ---
+
+// Add get_algorithm_name implementation here before search_string function
+const char *get_algorithm_name(search_func_t func)
+{
+    fprintf(stderr, "[krep.c] enter get_algorithm_name 1\n");
+    if (func == boyer_moore_search)
+        return "Boyer-Moore-Horspool";
+    else if (func == kmp_search)
+        return "Knuth-Morris-Pratt";
+    else if (func == regex_search)
+        return "Regex";
+    else if (func == aho_corasick_search)
+        return "Aho-Corasick";
+    else if (func == memchr_search)
+        return "memchr";
+    else if (func == memchr_short_search)
+        return "memchr-short";
+#if KREP_USE_SSE42
+    else if (func == simd_sse42_search)
+        return "SSE4.2";
+#endif
+#if KREP_USE_AVX2
+    else if (func == simd_avx2_search)
+        return "AVX2";
+#endif
+#if KREP_USE_NEON
+    else if (func == neon_search)
+        return "NEON";
+#endif
+    else
+        return "Unknown";
+    // fprintf(stderr, "[krep.c] exit get_algorithm_name 1\n");
+}
+// Search a string (remains single-threaded)
+int search_string(const search_params_t *params, const char *text)
+{
+    fprintf(stderr, "[krep.c] enter search_string 1\n");
+    // Initialize resources to NULL/0 for safe cleanup
+    size_t text_len = 0;
+    uint64_t final_count = 0;
+    match_result_t *matches = NULL;
+    int result_code = 1; // Default: no match
+    regex_t compiled_regex_local;
+    char *combined_regex_pattern = NULL;
+    bool regex_compiled = false;
+    search_params_t current_params = *params; // Make a mutable copy
+    ac_trie_t *local_ac_trie = NULL;          // Pointer for locally built trie
+    // fprintf(stderr, "[krep.c] exit search_string 1\n");
+
+    // --- Validation ---
+    if (current_params.num_patterns == 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 2\n");
+        fprintf(stderr, "Error: No pattern specified.\n");
+        return 2;
+        // fprintf(stderr, "[krep.c] exit search_string 2\n");
+    }
+
+    if (!text)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 3\n");
+        fprintf(stderr, "Error: NULL text in search_string.\n");
+        return 2;
+        // fprintf(stderr, "[krep.c] exit search_string 3\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter search_string 4\n");
+    text_len = strlen(text);
+    // fprintf(stderr, "[krep.c] exit search_string 4\n");
+
+    // Validate pattern length for literal search
+    if (!current_params.use_regex)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 5\n");
+        for (size_t i = 0; i < current_params.num_patterns; ++i)
+        {
+            fprintf(stderr, "[krep.c] enter search_string 6\n");
+            // Allow single empty pattern
+            if (current_params.pattern_lens[i] == 0)
+            {
+                fprintf(stderr, "[krep.c] enter search_string 7\n");
+                if (current_params.num_patterns > 1)
+                {
+                    fprintf(stderr, "[krep.c] enter search_string 8\n");
+                    fprintf(stderr, "Error: Empty pattern provided for literal search with multiple patterns.\n");
+                    return 2;
+                    // fprintf(stderr, "[krep.c] exit search_string 8\n");
+                }
+                // Single empty pattern is OK, Aho-Corasick handles this
+                // fprintf(stderr, "[krep.c] exit search_string 7\n");
+            }
+            else if (current_params.pattern_lens[i] > MAX_PATTERN_LENGTH)
+            {
+                fprintf(stderr, "[krep.c] enter search_string 9\n");
+                fprintf(stderr, "Error: Pattern '%s' too long (max %d).\n",
+                        current_params.patterns[i], MAX_PATTERN_LENGTH);
+                return 2;
+                // fprintf(stderr, "[krep.c] exit search_string 9\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_string 6\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_string 5\n");
+    }
+
+    // --- Resource Allocation ---
+
+    // Allocate results structure if tracking positions
+    if (current_params.track_positions)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 10\n");
+        // Start with a reasonable capacity based on text length
+        uint64_t initial_capacity = text_len > 10000 ? 1000 : 16;
+        matches = match_result_init(initial_capacity);
+        if (!matches)
+        {
+            fprintf(stderr, "[krep.c] enter search_string 11\n");
+            fprintf(stderr, "Error: Cannot allocate memory for match results.\n");
+            return 2;
+            // fprintf(stderr, "[krep.c] exit search_string 11\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_string 10\n");
+    }
+
+    // --- Build Aho-Corasick Trie (if needed) ---
+    fprintf(stderr, "[krep.c] enter search_string 12\n");
+    bool needs_ac_trie = (params->num_patterns > 1 && !params->use_regex);
+    // fprintf(stderr, "[krep.c] exit search_string 12\n");
+    
+    if (needs_ac_trie)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 13\n");
+        local_ac_trie = ac_trie_build(&current_params);
+        if (!local_ac_trie)
+        {
+            fprintf(stderr, "[krep.c] enter search_string 14\n");
+            fprintf(stderr, "krep: Error building Aho-Corasick trie.\n");
+            result_code = 2;
+            goto cleanup; // Use goto for consistent cleanup
+            // fprintf(stderr, "[krep.c] exit search_string 14\n");
+        }
+        current_params.ac_trie = local_ac_trie; // Assign to the mutable params copy
+        // fprintf(stderr, "[krep.c] exit search_string 13\n");
+    }
+
+    // Compile regex if needed
+    if (current_params.use_regex)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 15\n");
+        const char *regex_to_compile = NULL;
+
+        // Handle multiple patterns (combine with OR)
+        if (current_params.num_patterns > 1)
+        {
+            fprintf(stderr, "[krep.c] enter search_string 16\n");
+            // Calculate required buffer size
+            size_t total_len = 0;
+            for (size_t i = 0; i < current_params.num_patterns; ++i)
+            {
+                fprintf(stderr, "[krep.c] enter search_string 17\n");
+                // Add 6 for wrapping with (\b...\b)
+                total_len += current_params.pattern_lens[i] + (current_params.whole_word ? 6 : 2) + 1; // () or (\b...\b) + |
+                // fprintf(stderr, "[krep.c] exit search_string 17\n");
+            }
+
+            // Allocate and build combined pattern
+            combined_regex_pattern = malloc(total_len + 1);
+            if (!combined_regex_pattern)
+            {
+                fprintf(stderr, "[krep.c] enter search_string 18\n");
+                fprintf(stderr, "krep: Failed to allocate memory for combined regex.\n");
+                goto cleanup;
+                // fprintf(stderr, "[krep.c] exit search_string 18\n");
+            }
+
+            // Construct the combined pattern string
+            char *ptr = combined_regex_pattern;
+            for (size_t i = 0; i < current_params.num_patterns; ++i)
+            {
+                fprintf(stderr, "[krep.c] enter search_string 19\n");
+                if (current_params.whole_word)
+                {
+                    fprintf(stderr, "[krep.c] enter search_string 20\n");
+                    ptr += sprintf(ptr, "(\\b%s\\b)", current_params.patterns[i]);
+                    // fprintf(stderr, "[krep.c] exit search_string 20\n");
+                }
+                else
+                {
+                    fprintf(stderr, "[krep.c] enter search_string 21\n");
+                    ptr += sprintf(ptr, "(%s)", current_params.patterns[i]);
+                    // fprintf(stderr, "[krep.c] exit search_string 21\n");
+                }
+                if (i < current_params.num_patterns - 1)
+                {
+                    fprintf(stderr, "[krep.c] enter search_string 22\n");
+                    ptr += sprintf(ptr, "|");
+                    // fprintf(stderr, "[krep.c] exit search_string 22\n");
+                }
+                // fprintf(stderr, "[krep.c] exit search_string 19\n");
+            }
+            *ptr = '\0';
+            regex_to_compile = combined_regex_pattern;
+            // fprintf(stderr, "[krep.c] exit search_string 16\n");
+        }
+        else if (current_params.num_patterns == 1)
+        {
+            fprintf(stderr, "[krep.c] enter search_string 23\n");
+            if (current_params.whole_word)
+            {
+                fprintf(stderr, "[krep.c] enter search_string 24\n");
+                size_t len = strlen(current_params.patterns[0]);
+                char *tmp = malloc(len + 7); // (\b) + pattern + (\b) + null
+                if (!tmp)
+                {
+                    fprintf(stderr, "[krep.c] enter search_string 25\n");
+                    fprintf(stderr, "krep: Failed to allocate memory for regex pattern.\n");
+                    return 2;
+                    // fprintf(stderr, "[krep.c] exit search_string 25\n");
+                }
+                sprintf(tmp, "\\b%s\\b", current_params.patterns[0]);
+                regex_to_compile = tmp;
+                free(combined_regex_pattern); // In case it was set
+                combined_regex_pattern = tmp; // So it gets freed later
+                // fprintf(stderr, "[krep.c] exit search_string 24\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter search_string 26\n");
+                regex_to_compile = current_params.patterns[0];
+                // fprintf(stderr, "[krep.c] exit search_string 26\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_string 23\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter search_string 27\n");
+            // No patterns - shouldn't reach here due to earlier check
+            goto cleanup;
+            // fprintf(stderr, "[krep.c] exit search_string 27\n");
+        }
+
+        // Compile the regex
+        int rflags = REG_EXTENDED | REG_NEWLINE | (current_params.case_sensitive ? 0 : REG_ICASE);
+        int ret = regcomp(&compiled_regex_local, regex_to_compile, rflags);
+
+        if (ret != 0)
+        {
+            fprintf(stderr, "[krep.c] enter search_string 28\n");
+            char ebuf[256];
+            regerror(ret, &compiled_regex_local, ebuf, sizeof(ebuf));
+            fprintf(stderr, "krep: Regex compilation error: %s\n", ebuf);
+            goto cleanup;
+            // fprintf(stderr, "[krep.c] exit search_string 28\n");
+        }
+
+        regex_compiled = true;
+        current_params.compiled_regex = &compiled_regex_local;
+        // fprintf(stderr, "[krep.c] exit search_string 15\n");
+    }
+
+    // --- Execute Search ---
+
+    fprintf(stderr, "[krep.c] enter search_string 29\n");
+    // Select and run the appropriate search algorithm
+    search_func_t search_algo = select_search_algorithm(&current_params);
+
+    // Perform search and collect results
+    final_count = search_algo(&current_params, text, text_len, matches);
+
+    // Determine final result based on matches found
+    bool match_found = false;
+    size_t max_count = current_params.max_count; // Get max_count
+    // fprintf(stderr, "[krep.c] exit search_string 29\n");
+
+    // Adjust final_count based on max_count if necessary
+    if (max_count != SIZE_MAX && final_count > max_count)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 30\n");
+        final_count = max_count;
+        // fprintf(stderr, "[krep.c] exit search_string 30\n");
+    }
+    // Adjust matches->count if tracking positions
+    if (matches && max_count != SIZE_MAX && matches->count > max_count)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 31\n");
+        matches->count = max_count;
+        // fprintf(stderr, "[krep.c] exit search_string 31\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter search_string 32\n");
+    if (current_params.count_lines_mode || current_params.count_matches_mode)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 33\n");
+        match_found = (final_count > 0);
+        // fprintf(stderr, "[krep.c] exit search_string 33\n");
+    }
+    else
+    {
+        fprintf(stderr, "[krep.c] enter search_string 34\n");
+        match_found = (matches && matches->count > 0);
+        if (match_found)
+        {
+            fprintf(stderr, "[krep.c] enter search_string 35\n");
+            final_count = matches->count;
+            // fprintf(stderr, "[krep.c] exit search_string 35\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_string 34\n");
+    }
+
+    result_code = match_found ? 0 : 1;
+    // fprintf(stderr, "[krep.c] exit search_string 32\n");
+
+    // --- Print Results ---
+
+    if (current_params.count_lines_mode || current_params.count_matches_mode)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 36\n");
+        printf("%" PRIu64 "\n", final_count);
+        // fprintf(stderr, "[krep.c] exit search_string 36\n");
+    }
+    else
+    {
+        fprintf(stderr, "[krep.c] enter search_string 37\n");
+        // Print matches/lines if found
+        if (result_code == 0 && matches)
+        {
+            fprintf(stderr, "[krep.c] enter search_string 38\n");
+            // No need to sort for string search (single thread)
+            print_matching_items(NULL, text, text_len, matches, &current_params); // Pass params
+            // fprintf(stderr, "[krep.c] exit search_string 38\n");
+        }
+        // Handle case where match was found but no positions recorded (e.g., empty regex match)
+        else if (result_code == 0 && (!matches || matches->count == 0))
+        {
+            fprintf(stderr, "[krep.c] enter search_string 39\n");
+            if (only_matching)
+            {
+                fprintf(stderr, "[krep.c] enter search_string 40\n");
+                // Print empty match for -o (consistent with grep)
+                puts("");
+                // fprintf(stderr, "[krep.c] exit search_string 40\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter search_string 41\n");
+                // Print the whole (empty) line
+                puts("");
+                // fprintf(stderr, "[krep.c] exit search_string 41\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_string 39\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_string 37\n");
+    }
+
+cleanup:
+    fprintf(stderr, "[krep.c] enter search_string 42\n");
+    // --- Cleanup ---
+    if (regex_compiled)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 43\n");
+        regfree(&compiled_regex_local);
+        // fprintf(stderr, "[krep.c] exit search_string 43\n");
+    }
+    free(combined_regex_pattern);
+    match_result_free(matches);
+    // Free the Aho-Corasick trie if it was built locally
+    if (local_ac_trie)
+    {
+        fprintf(stderr, "[krep.c] enter search_string 44\n");
+        ac_trie_free(local_ac_trie);
+        // fprintf(stderr, "[krep.c] exit search_string 44\n");
+    }
+
+    return result_code;
+    // fprintf(stderr, "[krep.c] exit search_string 42\n");
+}
+int search_file(const search_params_t *params, const char *filename, int requested_thread_count)
+{
+    fprintf(stderr, "[krep.c] enter search_file 1\n");
+    search_params_t current_params = *params;
+    ac_trie_t *local_ac_trie = NULL; // Pointer for locally built trie
+
+    int result_code = 1;                         // Default: no match found
+    int fd = -1;                                 // File descriptor
+    struct stat file_stat;                       // File stats
+    size_t file_size = 0;                        // File size
+    char *file_data = MAP_FAILED;                // Mapped file data
+    match_result_t *global_matches = NULL;       // Global result collection
+    thread_data_t *thread_args = NULL;           // Thread arguments
+    regex_t compiled_regex_local;                // For local regex compilation
+    char *combined_regex_pattern = NULL;         // For combined regex patterns
+    int actual_thread_count = 0;                 // Number of threads to actually use
+    uint64_t final_count = 0;                    // Total count of lines or matches
+    size_t max_count = current_params.max_count; // Get max_count
+    // fprintf(stderr, "[krep.c] exit search_file 1\n");
+
+    // Validate patterns for literal search (not for regex)
+    if (!current_params.use_regex)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 2\n");
+        for (size_t i = 0; i < current_params.num_patterns; ++i)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 3\n");
+            // Check for empty pattern - only allowed if there's a single pattern
+            if (current_params.pattern_lens[i] == 0)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 4\n");
+                if (current_params.num_patterns > 1)
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 5\n");
+                    fprintf(stderr, "krep: %s: Error: Empty pattern provided for literal search with multiple patterns.\n", filename);
+                    return 2;
+                    // fprintf(stderr, "[krep.c] exit search_file 5\n");
+                }
+                // Single empty pattern is allowed, continue to next pattern
+                // fprintf(stderr, "[krep.c] exit search_file 4\n");
+            }
+
+            // Check for pattern length limit
+            if (current_params.pattern_lens[i] > MAX_PATTERN_LENGTH)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 6\n");
+                fprintf(stderr, "krep: %s: Error: Pattern '%s' too long (max %d).\n",
+                        filename, current_params.patterns[i], MAX_PATTERN_LENGTH);
+                return 2;
+                // fprintf(stderr, "[krep.c] exit search_file 6\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_file 3\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_file 2\n");
+    }
+
+    // Input from stdin
+    if (strcmp(filename, "-") == 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 7\n");
+        // Read from stdin into a dynamically growing buffer
+        size_t buffer_size = 4 * 1024 * 1024; // Start with 4MB
+        size_t used_size = 0;
+        char *buffer = malloc(buffer_size);
+        if (!buffer)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 8\n");
+            fprintf(stderr, "krep: Memory allocation failed for stdin buffer\n");
+            return 2;
+            // fprintf(stderr, "[krep.c] exit search_file 8\n");
+        }
+
+        // Read stdin in chunks
+        size_t read_chunk_size = 65536; // 64KB chunks
+        size_t bytes_read;
+        int fd = fileno(stdin);
+        while ((bytes_read = read(fd, buffer + used_size, read_chunk_size)) > 0)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 9\n");
+            used_size += bytes_read;
+            // Expand buffer if needed
+            if (used_size + read_chunk_size > buffer_size)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 10\n");
+                buffer_size *= 2;
+                char *new_buffer = realloc(buffer, buffer_size);
+                if (!new_buffer)
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 11\n");
+                    fprintf(stderr, "krep: Memory reallocation failed for stdin buffer\n");
+                    free(buffer);
+                    return 2;
+                    // fprintf(stderr, "[krep.c] exit search_file 11\n");
+                }
+                buffer = new_buffer;
+                // fprintf(stderr, "[krep.c] exit search_file 10\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_file 9\n");
+        }
+        if (ferror(stdin))
+        {
+            fprintf(stderr, "[krep.c] enter search_file 12\n");
+            fprintf(stderr, "krep: Error reading from stdin: %s\n", strerror(errno));
+            free(buffer);
+            return 2;
+            // fprintf(stderr, "[krep.c] exit search_file 12\n");
+        }
+
+        // Null-terminate the buffer for search_string
+        // Realloc to exact size + 1 for null terminator
+        char *final_buffer = realloc(buffer, used_size + 1);
+        if (!final_buffer)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 13\n");
+            fprintf(stderr, "krep: Memory reallocation failed for final stdin buffer\n");
+            free(buffer);
+            return 2;
+            // fprintf(stderr, "[krep.c] exit search_file 13\n");
+        }
+        buffer = final_buffer;
+        buffer[used_size] = '\0';
+
+        // Need to build AC trie here too if needed for stdin search
+        bool needs_ac_trie_stdin = (current_params.num_patterns > 1 && !current_params.use_regex);
+        if (needs_ac_trie_stdin)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 14\n");
+            local_ac_trie = ac_trie_build(&current_params);
+            if (!local_ac_trie)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 15\n");
+                fprintf(stderr, "krep: Error building Aho-Corasick trie for stdin.\n");
+                free(buffer);
+                return 2;
+                // fprintf(stderr, "[krep.c] exit search_file 15\n");
+            }
+            current_params.ac_trie = local_ac_trie;
+            // fprintf(stderr, "[krep.c] exit search_file 14\n");
+        }
+
+        // Search the buffer using search_string logic (single-threaded for stdin)
+        // search_string will now use the pre-built trie if current_params.ac_trie is set
+        result_code = search_string(&current_params, buffer);
+
+        // Cleanup for stdin
+        free(buffer);
+        if (local_ac_trie)
+        { // Free trie built for stdin
+            fprintf(stderr, "[krep.c] enter search_file 16\n");
+            ac_trie_free(local_ac_trie);
+            // fprintf(stderr, "[krep.c] exit search_file 16\n");
+        }
+        return result_code;
+        // fprintf(stderr, "[krep.c] exit search_file 7\n");
+    }
+
+    // --- Regular File Handling ---
+    fd = open(filename, O_RDONLY | O_CLOEXEC);
+    if (fd == -1)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 17\n");
+        fprintf(stderr, "krep: %s: %s\n", filename, strerror(errno));
+        return 2;
+        // fprintf(stderr, "[krep.c] exit search_file 17\n");
+    }
+    if (fstat(fd, &file_stat) == -1)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 18\n");
+        fprintf(stderr, "krep: %s: %s\n", filename, strerror(errno));
+        close(fd);
+        return 2;
+        // fprintf(stderr, "[krep.c] exit search_file 18\n");
+    }
+    file_size = file_stat.st_size;
+
+    // --- Handle Empty File ---
+    if (file_size == 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 19\n");
+        close(fd);
+        bool empty_match = false;
+        bool needs_ac_trie_empty = (current_params.num_patterns > 1 && !current_params.use_regex);
+
+        // Temporarily build trie just to check root outputs for empty pattern
+        if (needs_ac_trie_empty)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 20\n");
+            ac_trie_t *temp_trie = ac_trie_build(&current_params);
+            if (ac_trie_root_has_outputs(temp_trie))
+            {
+                fprintf(stderr, "[krep.c] enter search_file 21\n");
+                empty_match = true;
+                // fprintf(stderr, "[krep.c] exit search_file 21\n");
+            }
+            if (temp_trie)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 22\n");
+                ac_trie_free(temp_trie);
+                // fprintf(stderr, "[krep.c] exit search_file 22\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_file 20\n");
+        }
+        // Check regex empty match
+        else if (current_params.use_regex)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 23\n");
+            // Compile regex temporarily to check for empty match
+            regex_t temp_regex;
+            const char *regex_to_compile = NULL;
+            char *temp_combined_pattern = NULL;
+            if (current_params.num_patterns > 1)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 24\n");
+                size_t total_len = 0;
+                for (size_t i = 0; i < current_params.num_patterns; ++i)
+                    total_len += current_params.pattern_lens[i] + 3;
+                temp_combined_pattern = malloc(total_len + 1); // +1 for null
+                if (temp_combined_pattern)
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 25\n");
+                    char *ptr = temp_combined_pattern;
+                    for (size_t i = 0; i < current_params.num_patterns; ++i)
+                    {
+                        fprintf(stderr, "[krep.c] enter search_file 26\n");
+                        ptr += sprintf(ptr, "(%s)", current_params.patterns[i]);
+                        if (i < current_params.num_patterns - 1)
+                        {
+                            fprintf(stderr, "[krep.c] enter search_file 27\n");
+                            ptr += sprintf(ptr, "|");
+                            // fprintf(stderr, "[krep.c] exit search_file 27\n");
+                        }
+                        // fprintf(stderr, "[krep.c] exit search_file 26\n");
+                    }
+                    *ptr = '\0'; // Null terminate
+                    regex_to_compile = temp_combined_pattern;
+                    // fprintf(stderr, "[krep.c] exit search_file 25\n");
+                } // else: proceed with first pattern, might be inaccurate but avoids error
+                // fprintf(stderr, "[krep.c] exit search_file 24\n");
+            }
+            else if (current_params.num_patterns == 1)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 28\n");
+                regex_to_compile = current_params.patterns[0];
+                // fprintf(stderr, "[krep.c] exit search_file 28\n");
+            }
+            else
+            { // No patterns
+                fprintf(stderr, "[krep.c] enter search_file 29\n");
+                free(temp_combined_pattern);
+                return 1;
+                // fprintf(stderr, "[krep.c] exit search_file 29\n");
+            }
+
+            int rflags = REG_EXTENDED | REG_NEWLINE | (current_params.case_sensitive ? 0 : REG_ICASE);
+            if (regcomp(&temp_regex, regex_to_compile, rflags) == 0)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 30\n");
+                regmatch_t m;
+                if (regexec(&temp_regex, "", 1, &m, 0) == 0 && m.rm_so == 0 && m.rm_eo == 0)
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 31\n");
+                    empty_match = true;
+                    // fprintf(stderr, "[krep.c] exit search_file 31\n");
+                }
+                regfree(&temp_regex);
+                // fprintf(stderr, "[krep.c] exit search_file 30\n");
+            }
+            free(temp_combined_pattern);
+            // fprintf(stderr, "[krep.c] exit search_file 23\n");
+        }
+        // Check single literal empty pattern
+        else if (current_params.num_patterns == 1 && current_params.pattern_lens[0] == 0)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 32\n");
+            empty_match = true;
+            // fprintf(stderr, "[krep.c] exit search_file 32\n");
+        }
+
+        if (empty_match)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 33\n");
+            if (current_params.count_lines_mode || current_params.count_matches_mode)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 34\n");
+                printf("%s:1\n", filename); // Print count 1
+                // fprintf(stderr, "[krep.c] exit search_file 34\n");
+            }
+            else if (only_matching)
+            {                               // -o (global flag)
+                fprintf(stderr, "[krep.c] enter search_file 35\n");
+                printf("%s::\n", filename); // Print filename:: for empty match
+                // fprintf(stderr, "[krep.c] exit search_file 35\n");
+            }
+            else
+            {                              // default
+                fprintf(stderr, "[krep.c] enter search_file 36\n");
+                printf("%s:\n", filename); // Print filename: followed by empty line
+                // fprintf(stderr, "[krep.c] exit search_file 36\n");
+            }
+            atomic_store(&global_match_found_flag, true); // Signal match found for -r
+            return 0;                                     // Match found
+            // fprintf(stderr, "[krep.c] exit search_file 33\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter search_file 37\n");
+            if (current_params.count_lines_mode || current_params.count_matches_mode)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 38\n");
+                printf("%s:0\n", filename); // Print count 0
+                // fprintf(stderr, "[krep.c] exit search_file 38\n");
+            }
+            return 1;                       // No match
+            // fprintf(stderr, "[krep.c] exit search_file 37\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_file 19\n");
+    }
+
+    // Check if pattern is longer than file (only for single literal search)
+    if (!current_params.use_regex && current_params.num_patterns == 1 && current_params.pattern_lens[0] > file_size)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 39\n");
+        close(fd);
+        if (current_params.count_lines_mode || current_params.count_matches_mode)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 40\n");
+            printf("%s:0\n", filename);
+            // fprintf(stderr, "[krep.c] exit search_file 40\n");
+        }
+        return 1; // No match possible
+        // fprintf(stderr, "[krep.c] exit search_file 39\n");
+    }
+
+    // --- Build Aho-Corasick Trie (if needed, once for the file) ---
+    bool needs_ac_trie_file = (current_params.num_patterns > 1 && !current_params.use_regex);
+    if (needs_ac_trie_file)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 41\n");
+        local_ac_trie = ac_trie_build(&current_params);
+        if (!local_ac_trie)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 42\n");
+            fprintf(stderr, "krep: Error building Aho-Corasick trie for %s.\n", filename);
+            result_code = 2;
+            goto cleanup_file;
+            // fprintf(stderr, "[krep.c] exit search_file 42\n");
+        }
+        current_params.ac_trie = local_ac_trie; // Assign to the mutable params copy
+        // fprintf(stderr, "[krep.c] exit search_file 41\n");
+    }
+
+    // --- Compile Regex (if needed, once for the file) ---
+    if (current_params.use_regex)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 43\n");
+        const char *regex_to_compile = NULL;
+        if (current_params.num_patterns > 1)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 44\n");
+            // Combine multiple regex patterns with '|'
+            size_t total_len = 0;
+            for (size_t i = 0; i < current_params.num_patterns; ++i)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 45\n");
+                // Add 6 for wrapping with (\b...\b)
+                total_len += current_params.pattern_lens[i] + (current_params.whole_word ? 6 : 2) + 1; // () or (\b...\b) + |
+                // fprintf(stderr, "[krep.c] exit search_file 45\n");
+            }
+            combined_regex_pattern = malloc(total_len + 1); // +1 for null terminator
+            if (!combined_regex_pattern)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 46\n");
+                fprintf(stderr, "krep: %s: Failed to allocate memory for combined regex.\n", filename);
+                close(fd);
+                return 2;
+                // fprintf(stderr, "[krep.c] exit search_file 46\n");
+            }
+            char *ptr = combined_regex_pattern;
+            for (size_t i = 0; i < current_params.num_patterns; ++i)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 47\n");
+                if (current_params.whole_word)
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 48\n");
+                    ptr += sprintf(ptr, "(\\b%s\\b)", current_params.patterns[i]);
+                    // fprintf(stderr, "[krep.c] exit search_file 48\n");
+                }
+                else
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 49\n");
+                    ptr += sprintf(ptr, "(%s)", current_params.patterns[i]);
+                    // fprintf(stderr, "[krep.c] exit search_file 49\n");
+                }
+                if (i < current_params.num_patterns - 1)
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 50\n");
+                    ptr += sprintf(ptr, "|");
+                    // fprintf(stderr, "[krep.c] exit search_file 50\n");
+                }
+                // fprintf(stderr, "[krep.c] exit search_file 47\n");
+            }
+            *ptr = '\0'; // Null terminate
+            regex_to_compile = combined_regex_pattern;
+            // fprintf(stderr, "[krep.c] exit search_file 44\n");
+        }
+        else if (current_params.num_patterns == 1)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 51\n");
+            if (current_params.whole_word)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 52\n");
+                size_t len = strlen(current_params.patterns[0]);
+                char *tmp = malloc(len + 7); // (\b) + pattern + (\b) + null
+                if (!tmp)
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 53\n");
+                    fprintf(stderr, "krep: Failed to allocate memory for regex pattern.\n");
+                    close(fd);
+                    return 2;
+                    // fprintf(stderr, "[krep.c] exit search_file 53\n");
+                }
+                sprintf(tmp, "\\b%s\\b", current_params.patterns[0]);
+                regex_to_compile = tmp;
+                free(combined_regex_pattern); // In case it was set
+                combined_regex_pattern = tmp; // So it gets freed later
+                // fprintf(stderr, "[krep.c] exit search_file 52\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter search_file 54\n");
+                regex_to_compile = current_params.patterns[0]; // Ensure correct pattern is used
+                // fprintf(stderr, "[krep.c] exit search_file 54\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_file 51\n");
+        }
+        else
+        { // Should not happen due to earlier check
+            fprintf(stderr, "[krep.c] enter search_file 55\n");
+            close(fd);
+            return 1;
+            // fprintf(stderr, "[krep.c] exit search_file 55\n");
+        }
+
+        int rflags = REG_EXTENDED | REG_NEWLINE | (current_params.case_sensitive ? 0 : REG_ICASE);
+        int ret = regcomp(&compiled_regex_local, regex_to_compile, rflags);
+        if (ret != 0)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 56\n");
+            char ebuf[256];
+            regerror(ret, &compiled_regex_local, ebuf, sizeof(ebuf));
+            fprintf(stderr, "krep: Regex compilation error for %s: %s\n", filename, ebuf);
+            close(fd);
+            free(combined_regex_pattern);
+            return 2;
+            // fprintf(stderr, "[krep.c] exit search_file 56\n");
+        }
+        // Modify the mutable copy of params
+        search_params_t mutable_params = current_params;
+        mutable_params.compiled_regex = &compiled_regex_local;
+        current_params = mutable_params; // Update current_params to use for threads
+        // Ensure local_ac_trie is NULL if regex is used
+        if (local_ac_trie)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 57\n");
+            ac_trie_free(local_ac_trie);
+            local_ac_trie = NULL;
+            current_params.ac_trie = NULL;
+            // fprintf(stderr, "[krep.c] exit search_file 57\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_file 43\n");
+    }
+
+    // --- Memory Map File ---
+    // FIX: Use conditional compilation for MAP_POPULATE
+    int mmap_base_flags = MAP_PRIVATE;
+    file_data = MAP_FAILED; // Initialize file_data
+
+#ifdef MAP_POPULATE
+    fprintf(stderr, "[krep.c] enter search_file 58\n");
+    // Try with MAP_POPULATE first
+    int mmap_flags_populate = mmap_base_flags | MAP_POPULATE;
+    file_data = mmap(NULL, file_size, PROT_READ, mmap_flags_populate, fd, 0);
+
+    // If MAP_POPULATE failed, try without it
+    if (file_data == MAP_FAILED && errno == ENOTSUP) // Check if MAP_POPULATE is specifically not supported
+    {
+        fprintf(stderr, "[krep.c] enter search_file 59\n");
+        // fprintf(stderr, "krep: %s: mmap with MAP_POPULATE not supported, retrying without...\n", filename);
+        file_data = mmap(NULL, file_size, PROT_READ, mmap_base_flags, fd, 0);
+        // fprintf(stderr, "[krep.c] exit search_file 59\n");
+    }
+    else if (file_data == MAP_FAILED)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 60\n");
+        fprintf(stderr, "krep: %s: mmap with MAP_POPULATE failed (%s), retrying without...\n", filename, strerror(errno));
+        file_data = mmap(NULL, file_size, PROT_READ, mmap_base_flags, fd, 0);
+        // fprintf(stderr, "[krep.c] exit search_file 60\n");
+    }
+    // fprintf(stderr, "[krep.c] exit search_file 58\n");
+#else
+    fprintf(stderr, "[krep.c] enter search_file 61\n");
+    // MAP_POPULATE not defined, just call mmap without it
+    file_data = mmap(NULL, file_size, PROT_READ, mmap_base_flags, fd, 0);
+    // fprintf(stderr, "[krep.c] exit search_file 61\n");
+#endif
+
+    // Check if mmap failed even after potential fallback
+    if (file_data == MAP_FAILED)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 62\n");
+        fprintf(stderr, "krep: %s: mmap: %s\n", filename, strerror(errno));
+        close(fd);
+        if (current_params.use_regex && current_params.compiled_regex == &compiled_regex_local)
+            regfree(&compiled_regex_local);
+        free(combined_regex_pattern);
+        // No need to free global_matches, threads, thread_args here, handled by goto cleanup_file
+        result_code = 2;
+        goto cleanup_file; // Use goto to ensure proper cleanup
+        // fprintf(stderr, "[krep.c] exit search_file 62\n");
+    }
+
+    // Advise the kernel about expected access pattern
+    if (madvise(file_data, file_size, MADV_SEQUENTIAL | MADV_WILLNEED) != 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 63\n");
+        fprintf(stderr, "krep: %s: Warning: madvise failed: %s\n", filename, strerror(errno));
+        // Continue execution since this is just an optimization
+        // fprintf(stderr, "[krep.c] exit search_file 63\n");
+    }
+
+    close(fd); // Close file descriptor after mmap
+    fd = -1;
+
+    // --- Determine Thread Count and Chunking ---
+    if (requested_thread_count == 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 64\n");
+        long cores = sysconf(_SC_NPROCESSORS_ONLN);
+        actual_thread_count = (cores > 0) ? (int)cores : 1;
+        // fprintf(stderr, "[krep.c] exit search_file 64\n");
+    }
+    else
+    {
+        fprintf(stderr, "[krep.c] enter search_file 65\n");
+        actual_thread_count = requested_thread_count;
+        // fprintf(stderr, "[krep.c] exit search_file 65\n");
+    }
+    int max_threads_by_size = (file_size > 0) ? (int)((file_size + MIN_CHUNK_SIZE - 1) / MIN_CHUNK_SIZE) : 1;
+    if (actual_thread_count > max_threads_by_size && max_threads_by_size > 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 66\n");
+        actual_thread_count = max_threads_by_size;
+        // fprintf(stderr, "[krep.c] exit search_file 66\n");
+    }
+    if (actual_thread_count <= 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 67\n");
+        actual_thread_count = 1;
+        // fprintf(stderr, "[krep.c] exit search_file 67\n");
+    }
+
+    // --- Initialize Threading Resources ---
+    thread_args = malloc(actual_thread_count * sizeof(thread_data_t));
+
+    if (!thread_args)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 68\n");
+        perror("krep: Cannot allocate thread resources");
+        result_code = 2;
+        goto cleanup_file;
+        // fprintf(stderr, "[krep.c] exit search_file 68\n");
+    }
+
+    // Allocate global results structure if tracking positions
+    if (current_params.track_positions)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 69\n");
+        uint64_t initial_cap = (file_size / 1000 > 1000) ? file_size / 1000 : 1000;
+        global_matches = match_result_init(initial_cap);
+        if (!global_matches)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 70\n");
+            fprintf(stderr, "krep: Error: Cannot allocate global match results for %s.\n", filename);
+            result_code = 2;
+            goto cleanup_file;
+            // fprintf(stderr, "[krep.c] exit search_file 70\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_file 69\n");
+    }
+
+    // --- Launch Threads ---
+    size_t chunk_size_calc = (file_size + actual_thread_count - 1) / actual_thread_count;
+    if (chunk_size_calc == 0 && file_size > 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 71\n");
+        chunk_size_calc = file_size;
+        // fprintf(stderr, "[krep.c] exit search_file 71\n");
+    }
+    // Ensure minimum chunk size
+    if (chunk_size_calc < MIN_CHUNK_SIZE && file_size > MIN_CHUNK_SIZE)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 72\n");
+        chunk_size_calc = MIN_CHUNK_SIZE;
+        // Recalculate thread count based on adjusted chunk size
+        actual_thread_count = (file_size + chunk_size_calc - 1) / chunk_size_calc;
+        if (actual_thread_count <= 0)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 73\n");
+            actual_thread_count = 1;
+            // fprintf(stderr, "[krep.c] exit search_file 73\n");
+        }
+        // Reallocate thread resources if count changed significantly (optional, could just use max)
+        // For simplicity, we assume initial allocation was sufficient or handle errors later.
+        // fprintf(stderr, "[krep.c] exit search_file 72\n");
+    }
+
+    size_t current_pos = 0;
+    int threads_launched = 0;
+    // Calculate max pattern length for overlap (only for literal search)
+    size_t max_literal_pattern_len = 0;
+    if (!current_params.use_regex)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 74\n");
+        for (size_t i = 0; i < current_params.num_patterns; ++i)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 75\n");
+            if (current_params.pattern_lens[i] > max_literal_pattern_len)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 76\n");
+                max_literal_pattern_len = current_params.pattern_lens[i];
+                // fprintf(stderr, "[krep.c] exit search_file 76\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_file 75\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_file 74\n");
+    }
+
+    // Determine how many threads to use based on file size and available cores
+    int available_cores = requested_thread_count > 0 ? requested_thread_count : sysconf(_SC_NPROCESSORS_ONLN);
+    if (available_cores <= 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 77\n");
+        available_cores = 1;
+        // fprintf(stderr, "[krep.c] exit search_file 77\n");
+    }
+
+    // Calculate optimal number of threads: min(cores, max(1, file_size/(4MB)))
+    // This scales threads with file size, but caps at CPU core count
+    int optimal_threads = 1;
+    if (file_size > 0)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 78\n");
+        size_t chunk_threshold = 4 * 1024 * 1024; // 4MB per thread minimum
+        optimal_threads = file_size / chunk_threshold;
+        if (optimal_threads > available_cores)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 79\n");
+            optimal_threads = available_cores;
+            // fprintf(stderr, "[krep.c] exit search_file 79\n");
+        }
+        if (optimal_threads < 1)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 80\n");
+            optimal_threads = 1;
+            // fprintf(stderr, "[krep.c] exit search_file 80\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_file 78\n");
+    }
+
+
+    for (int i = 0; i < actual_thread_count; ++i)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 81\n");
+        if (current_pos >= file_size)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 82\n");
+            actual_thread_count = i; // Update actual count
+            break;
+            // fprintf(stderr, "[krep.c] exit search_file 82\n");
+        }
+
+        thread_args[i].thread_id = i;
+        thread_args[i].params = &current_params; // Pass params containing the pre-built trie
+        thread_args[i].chunk_start = file_data + current_pos;
+
+        size_t this_chunk_len = (current_pos + chunk_size_calc > file_size) ? (file_size - current_pos) : chunk_size_calc;
+
+        // Overlap needed for literal patterns. Regex handled differently (often needs no overlap or different logic).
+        size_t overlap = (!current_params.use_regex && max_literal_pattern_len > 0 && i < actual_thread_count - 1) ? max_literal_pattern_len - 1 : 0;
+        size_t effective_chunk_len = (current_pos + this_chunk_len + overlap > file_size) ? (file_size - current_pos) : (this_chunk_len + overlap);
+
+        // Ensure chunk length isn't zero if there's still data
+        if (effective_chunk_len == 0 && current_pos < file_size)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 83\n");
+            effective_chunk_len = file_size - current_pos;
+            // fprintf(stderr, "[krep.c] exit search_file 83\n");
+        }
+
+        thread_args[i].chunk_len = effective_chunk_len;
+        thread_args[i].local_result = NULL;
+        thread_args[i].count_result = 0;
+        thread_args[i].error_flag = false;
+
+        if (effective_chunk_len > 0)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 84\n");
+            // Use search_chunk_thread which handles multiple patterns via Aho-Corasick or Regex
+            
+            search_chunk_thread(&thread_args[i]);
+            
+            threads_launched++;
+            // fprintf(stderr, "[krep.c] exit search_file 84\n");
+        }
+        current_pos += this_chunk_len; // Advance by non-overlapped length
+        // fprintf(stderr, "[krep.c] exit search_file 81\n");
+    }
+    actual_thread_count = threads_launched;
+
+    // --- Wait for Threads and Aggregate Results ---
+    bool merge_error = false;
+    for (int i = 0; i < actual_thread_count; ++i)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 85\n");
+
+        // Always process results from thread_args, regardless of how the thread was executed
+        if (result_code != 2 && !merge_error)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 86\n");
+            // Sum counts (lines or matches). Note: Line count might be slightly off at boundaries.
+            uint64_t thread_count = thread_args[i].count_result;
+            if (max_count != SIZE_MAX)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 87\n");
+                uint64_t remaining_limit = (final_count >= max_count) ? 0 : max_count - final_count;
+                if (thread_count > remaining_limit)
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 88\n");
+                    thread_count = remaining_limit; // Cap thread count contribution
+                    // fprintf(stderr, "[krep.c] exit search_file 88\n");
+                }
+                // fprintf(stderr, "[krep.c] exit search_file 87\n");
+            }
+            final_count += thread_count;
+
+            // Merge position results if tracking, respecting max_count
+            if (current_params.track_positions && global_matches && thread_args[i].local_result)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 89\n");
+                if (max_count == SIZE_MAX || global_matches->count < max_count)
+                {
+                    fprintf(stderr, "[krep.c] enter search_file 90\n");
+                    uint64_t remaining_limit = (max_count == SIZE_MAX) ? SIZE_MAX : max_count - global_matches->count;
+                    uint64_t merge_count = 0;
+                    for (uint64_t j = 0; j < thread_args[i].local_result->count && merge_count < remaining_limit; ++j)
+                    {
+                        fprintf(stderr, "[krep.c] enter search_file 91\n");
+                        // Adjust offsets based on the original chunk start (relative to file_data)
+                        size_t chunk_offset = thread_args[i].chunk_start - file_data;
+                        if (match_result_add(global_matches,
+                                             thread_args[i].local_result->positions[j].start_offset + chunk_offset,
+                                             thread_args[i].local_result->positions[j].end_offset + chunk_offset))
+                        {
+                            fprintf(stderr, "[krep.c] enter search_file 92\n");
+                            merge_count++;
+                            // fprintf(stderr, "[krep.c] exit search_file 92\n");
+                        }
+                        else
+                        {
+                            fprintf(stderr, "[krep.c] enter search_file 93\n");
+                            fprintf(stderr, "krep: %s: Failed to merge match result from thread %d.\n", filename, i);
+                            merge_error = true;
+                            break; // Stop merging for this thread on error
+                            // fprintf(stderr, "[krep.c] exit search_file 93\n");
+                        }
+                        // fprintf(stderr, "[krep.c] exit search_file 91\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit search_file 90\n");
+                }
+                match_result_free(thread_args[i].local_result); // Free local result after merging
+                thread_args[i].local_result = NULL;
+                // fprintf(stderr, "[krep.c] exit search_file 89\n");
+            }
+            else if (thread_args[i].local_result)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 94\n");
+                // Free local result if not merged (e.g., limit reached or not tracking)
+                match_result_free(thread_args[i].local_result);
+                thread_args[i].local_result = NULL;
+                // fprintf(stderr, "[krep.c] exit search_file 94\n");
+            }
+
+            if (merge_error)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 95\n");
+                result_code = 2;
+                // Continue cleanup but don't process further results
+                // fprintf(stderr, "[krep.c] exit search_file 95\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_file 86\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_file 85\n");
+    }
+
+    // --- Final Processing and Output ---
+    if (result_code != 2)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 96\n");
+        // Determine final result code based on aggregated count/matches
+        result_code = (final_count > 0) ? 0 : 1;
+        if (result_code == 0)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 97\n");
+            atomic_store(&global_match_found_flag, true); // Signal match found for -r
+            // fprintf(stderr, "[krep.c] exit search_file 97\n");
+        }
+
+        if (current_params.count_lines_mode || current_params.count_matches_mode)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 98\n");
+            printf("%s:%" PRIu64 "\n", filename, final_count);
+            // fprintf(stderr, "[krep.c] exit search_file 98\n");
+        }
+        else if (result_code == 0 && global_matches)
+        {
+            fprintf(stderr, "[krep.c] enter search_file 99\n");
+            // Sort matches by start offset before printing if needed (optional, but good practice)
+            qsort(global_matches->positions, global_matches->count, sizeof(match_position_t), compare_match_positions);
+
+            // Print matching lines/parts, respecting max_count via print_matching_items
+            print_matching_items(filename, file_data, file_size, global_matches, &current_params); // Pass params
+            // fprintf(stderr, "[krep.c] exit search_file 99\n");
+        }
+        // Handle case where match was found but no positions recorded (e.g., empty regex match)
+        else if (result_code == 0 && (!global_matches || global_matches->count == 0))
+        {
+            fprintf(stderr, "[krep.c] enter search_file 100\n");
+            if (only_matching)
+            {
+                fprintf(stderr, "[krep.c] enter search_file 101\n");
+                printf("%s:1:\n", filename); // Line number 1, empty match
+                // fprintf(stderr, "[krep.c] exit search_file 101\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter search_file 102\n");
+                printf("%s:\n", filename); // Empty line
+                // fprintf(stderr, "[krep.c] exit search_file 102\n");
+            }
+            // fprintf(stderr, "[krep.c] exit search_file 100\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_file 96\n");
+    }
+
+cleanup_file:
+    fprintf(stderr, "[krep.c] enter search_file 103\n");
+    // --- Cleanup Resources ---
+    if (file_data != MAP_FAILED)
+        munmap(file_data, file_size);
+    if (current_params.use_regex && current_params.compiled_regex == &compiled_regex_local)
+        regfree(&compiled_regex_local);
+    free(combined_regex_pattern);
+    match_result_free(global_matches);
+    free(thread_args);
+    if (fd != -1)
+        close(fd);
+    // Free the Aho-Corasick trie if it was built for this file
+    if (local_ac_trie)
+    {
+        fprintf(stderr, "[krep.c] enter search_file 104\n");
+        ac_trie_free(local_ac_trie);
+        // fprintf(stderr, "[krep.c] exit search_file 104\n");
+    }
+
+    return result_code;
+    // fprintf(stderr, "[krep.c] exit search_file 103\n");
+}
+
+// --- Recursive Directory Search ---
+
+// Check if a directory name should be skipped
+static bool should_skip_directory(const char *dirname)
+{
+    fprintf(stderr, "[krep.c] enter should_skip_directory 1\n");
+    // Skip hidden directories starting with '.' (in addition to "." and "..")
+    if (dirname[0] == '.' && strcmp(dirname, ".") != 0 && strcmp(dirname, "..") != 0)
+    {
+        fprintf(stderr, "[krep.c] enter should_skip_directory 2\n");
+        return true;
+        // fprintf(stderr, "[krep.c] exit should_skip_directory 2\n");
+    }
+    // Check against the predefined list of directories to skip
+    for (size_t i = 0; i < num_skip_directories; ++i)
+    {
+        fprintf(stderr, "[krep.c] enter should_skip_directory 3\n");
+        if (strcmp(dirname, skip_directories[i]) == 0)
+        {
+            fprintf(stderr, "[krep.c] enter should_skip_directory 4\n");
+            return true;
+            // fprintf(stderr, "[krep.c] exit should_skip_directory 4\n");
+        }
+        // fprintf(stderr, "[krep.c] exit should_skip_directory 3\n");
+    }
+    return false;
+    // fprintf(stderr, "[krep.c] exit should_skip_directory 1\n");
+}
+
+// Check if a file extension should be skipped
+static bool should_skip_extension(const char *filename)
+{
+    fprintf(stderr, "[krep.c] enter should_skip_extension 1\n");
+    // Find the last dot in the filename
+    const char *dot = strrchr(filename, '.');
+
+    // If no dot, or dot is at the beginning (hidden file), or dot is the last character,
+    // it's not an extension we check here.
+    if (!dot || dot == filename || *(dot + 1) == '\0')
+    {
+        fprintf(stderr, "[krep.c] enter should_skip_extension 2\n");
+        return false; // Not an extension we care about
+        // fprintf(stderr, "[krep.c] exit should_skip_extension 2\n");
+    }
+
+    // Check for .min. files (minified files like .min.js, .min.css)
+    // These are common enough to merit a special check
+    const char *min_ext = strstr(dot, ".min.");
+    if (min_ext && min_ext == dot)
+    {
+        fprintf(stderr, "[krep.c] enter should_skip_extension 3\n");
+        return true; // Skip minified files
+        // fprintf(stderr, "[krep.c] exit should_skip_extension 3\n");
+    }
+
+    // Check against the predefined list
+    for (size_t i = 0; i < num_skip_extensions; ++i)
+    {
+        fprintf(stderr, "[krep.c] enter should_skip_extension 4\n");
+        if (strcasecmp(dot, skip_extensions[i]) == 0)
+        {
+            fprintf(stderr, "[krep.c] enter should_skip_extension 5\n");
+            return true;
+            // fprintf(stderr, "[krep.c] exit should_skip_extension 5\n");
+        }
+        // fprintf(stderr, "[krep.c] exit should_skip_extension 4\n");
+    }
+
+    return false;
+    // fprintf(stderr, "[krep.c] exit should_skip_extension 1\n");
+}
+
+// Check if a file appears to be binary
+static bool is_binary_file(const char *filepath)
+{
+    fprintf(stderr, "[krep.c] enter is_binary_file 1\n");
+    // Open file and check for binary content
+    FILE *f = fopen(filepath, "rb");
+    if (!f)
+    {
+        fprintf(stderr, "[krep.c] enter is_binary_file 2\n");
+        return false; // Treat fopen error as non-binary (might be permission issue)
+        // fprintf(stderr, "[krep.c] exit is_binary_file 2\n");
+    }
+
+    char buffer[BINARY_CHECK_BUFFER_SIZE];
+    // Read a chunk from the beginning of the file
+    int fd = fileno(f);
+    size_t bytes_read = read(fd, buffer, sizeof(buffer));
+    fclose(f);
+
+    if (bytes_read == 0)
+    {
+        fprintf(stderr, "[krep.c] enter is_binary_file 3\n");
+        return false; // Empty file is not binary
+        // fprintf(stderr, "[krep.c] exit is_binary_file 3\n");
+    }
+
+    // Check if a null byte exists within the read buffer
+    return memchr(buffer, '\0', bytes_read) != NULL;
+    // fprintf(stderr, "[krep.c] exit is_binary_file 1\n");
+}
+// Recursive directory search function
+// Note: Directory traversal itself remains serial. Parallelism happens within search_file.
+int search_directory_recursive(const char *base_dir, const search_params_t *params, int thread_count)
+{
+    fprintf(stderr, "[krep.c] enter search_directory_recursive 1\n");
+    // Try opening the directory
+    DIR *dir = opendir(base_dir);
+    if (!dir)
+    {
+        // Better error handling: print more informative message for common errors
+        if (errno == EACCES)
+        {
+            fprintf(stderr, "[krep.c] enter search_directory_recursive 2\n");
+            fprintf(stderr, "krep: %s: Permission denied\n", base_dir);
+            // fprintf(stderr, "[krep.c] exit search_directory_recursive 2\n");
+        }
+        else if (errno != ENOENT)
+        { // Still silent for not found
+            fprintf(stderr, "[krep.c] enter search_directory_recursive 3\n");
+            fprintf(stderr, "krep: %s: %s\n", base_dir, strerror(errno));
+            // fprintf(stderr, "[krep.c] exit search_directory_recursive 3\n");
+        }
+        // Return 0 errors for permission/not found, 1 otherwise
+        return (errno == EACCES || errno == ENOENT) ? 0 : 1;
+        // fprintf(stderr, "[krep.c] exit search_directory_recursive 1\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter search_directory_recursive 4\n");
+    struct dirent *entry;       // Structure to hold directory entry info
+    int total_errors = 0;       // Accumulator for errors during recursion
+    char path_buffer[PATH_MAX]; // Buffer to construct full paths
+    // fprintf(stderr, "[krep.c] exit search_directory_recursive 4\n");
+
+    // Read directory entries one by one
+    while ((entry = readdir(dir)) != NULL)
+    {
+        fprintf(stderr, "[krep.c] enter search_directory_recursive 5\n");
+        // Skip "." and ".." entries
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+        {
+            fprintf(stderr, "[krep.c] enter search_directory_recursive 6\n");
+            continue;
+            // fprintf(stderr, "[krep.c] exit search_directory_recursive 6\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_directory_recursive 5\n");
+
+        fprintf(stderr, "[krep.c] enter search_directory_recursive 7\n");
+        // Construct the full path for the entry - more robust path joining
+        int path_len;
+        if (base_dir[strlen(base_dir) - 1] == '/')
+        {
+            fprintf(stderr, "[krep.c] enter search_directory_recursive 8\n");
+            path_len = snprintf(path_buffer, sizeof(path_buffer), "%s%s", base_dir, entry->d_name);
+            // fprintf(stderr, "[krep.c] exit search_directory_recursive 8\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter search_directory_recursive 9\n");
+            path_len = snprintf(path_buffer, sizeof(path_buffer), "%s/%s", base_dir, entry->d_name);
+            // fprintf(stderr, "[krep.c] exit search_directory_recursive 9\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_directory_recursive 7\n");
+
+        fprintf(stderr, "[krep.c] enter search_directory_recursive 10\n");
+        // Check for path construction errors (e.g., path too long)
+        if (path_len < 0 || (size_t)path_len >= sizeof(path_buffer))
+        {
+            fprintf(stderr, "[krep.c] enter search_directory_recursive 11\n");
+            fprintf(stderr, "krep: Error constructing path for %s/%s (too long?)\n", base_dir, entry->d_name);
+            total_errors++;
+            continue;
+            // fprintf(stderr, "[krep.c] exit search_directory_recursive 11\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_directory_recursive 10\n");
+
+        fprintf(stderr, "[krep.c] enter search_directory_recursive 12\n");
+        struct stat entry_stat; // Structure to hold file status info
+        // Use lstat to get info about the entry itself (doesn't follow symlinks)
+        if (lstat(path_buffer, &entry_stat) == -1)
+        {
+            fprintf(stderr, "[krep.c] enter search_directory_recursive 13\n");
+            // Ignore "No such file or directory" errors (e.g., broken symlink), report others
+            if (errno != ENOENT)
+            {
+                fprintf(stderr, "[krep.c] enter search_directory_recursive 14\n");
+                fprintf(stderr, "krep: %s: %s\n", path_buffer, strerror(errno));
+                total_errors++;
+                // fprintf(stderr, "[krep.c] exit search_directory_recursive 14\n");
+            }
+            continue;
+            // fprintf(stderr, "[krep.c] exit search_directory_recursive 13\n");
+        }
+        // fprintf(stderr, "[krep.c] exit search_directory_recursive 12\n");
+
+        fprintf(stderr, "[krep.c] enter search_directory_recursive 15\n");
+        // If the entry is a directory:
+        if (S_ISDIR(entry_stat.st_mode))
+        {
+            fprintf(stderr, "[krep.c] enter search_directory_recursive 16\n");
+            // Check if this directory should be skipped
+            if (should_skip_directory(entry->d_name))
+            {
+                fprintf(stderr, "[krep.c] enter search_directory_recursive 17\n");
+                continue; // Skip this directory
+                // fprintf(stderr, "[krep.c] exit search_directory_recursive 17\n");
+            }
+            // Otherwise, recurse into the subdirectory
+            total_errors += search_directory_recursive(path_buffer, params, thread_count);
+            // fprintf(stderr, "[krep.c] exit search_directory_recursive 16\n");
+        }
+        // If the entry is a regular file:
+        else if (S_ISREG(entry_stat.st_mode))
+        {
+            fprintf(stderr, "[krep.c] enter search_directory_recursive 18\n");
+            // Check if the file should be skipped based on extension
+            if (should_skip_extension(entry->d_name))
+            {
+                fprintf(stderr, "[krep.c] enter search_directory_recursive 19\n");
+                continue; // Skip this file
+                // fprintf(stderr, "[krep.c] exit search_directory_recursive 19\n");
+            }
+
+            // Don't check binary files too aggressively as it might miss valid text files
+            // Only check files larger than a certain threshold
+            if (entry_stat.st_size > 1024 * 1024 && is_binary_file(path_buffer))
+            {
+                fprintf(stderr, "[krep.c] enter search_directory_recursive 20\n");
+                continue; // Skip this file - it's binary and large
+                // fprintf(stderr, "[krep.c] exit search_directory_recursive 20\n");
+            }
+
+            // Otherwise, search the file using search_file (which handles parallelism)
+            int file_result = search_file(params, path_buffer, thread_count);
+            // If search_file returns 2, it indicates an error
+            if (file_result == 2)
+            {
+                fprintf(stderr, "[krep.c] enter search_directory_recursive 21\n");
+                total_errors++;
+                // fprintf(stderr, "[krep.c] exit search_directory_recursive 21\n");
+            }
+            // Note: global_match_found_flag is set within search_file if matches are found
+            // fprintf(stderr, "[krep.c] exit search_directory_recursive 18\n");
+        }
+        // Ignore other file types (symlinks are not followed by lstat, sockets, pipes, etc.)
+        // fprintf(stderr, "[krep.c] exit search_directory_recursive 15\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter search_directory_recursive 22\n");
+    closedir(dir);       // Close the directory stream
+    return total_errors; // Return the total count of errors encountered
+    // fprintf(stderr, "[krep.c] exit search_directory_recursive 22\n");
+}
+
+// --- Main Entry Point ---
+
+// Exclude main if TESTING is defined (for linking with test harness)
+#if !defined(TESTING)
+int main(int argc, char *argv[])
+{
+    fprintf(stderr, "[krep.c] enter main 1\n");
+    for (int i = 0; i < 256; i++)
+    {
+        fprintf(stderr, "[krep.c] enter main 2\n");
+        lower_table[i] = tolower(i);
+        // fprintf(stderr, "[krep.c] exit main 2\n");
+    }
+    
+    // --- Argument Parsing State ---
+    search_params_t params = {0}; // Initialize search parameters
+    params.case_sensitive = true; // Default
+    params.num_patterns = 0;
+    params.use_regex = false; // Default to literal search
+
+    // Temporary storage for multiple patterns from -e
+    char *pattern_args[MAX_PATTERN_LENGTH]; // Store pointers to patterns from argv
+    size_t pattern_lens[MAX_PATTERN_LENGTH];
+    size_t num_patterns_found = 0;
+
+    // Add an array to track which patterns were dynamically allocated and need to be freed
+    bool pattern_needs_free[MAX_PATTERN_LENGTH] = {false};
+
+    char *target_arg = NULL;                 // The file, directory, or string to search
+    bool count_only_flag = false;            // Flag for -c
+    bool string_mode = false;                // Flag for -s (search string instead of file)
+    bool recursive_mode = false;             // Flag for -r (recursive directory search)
+    int thread_count = DEFAULT_THREAD_COUNT; // Thread count (0 = auto)
+    const char *color_when = "auto";         // Color output control ('auto', 'always', 'never')
+    // fprintf(stderr, "[krep.c] exit main 1\n");
+
+    fprintf(stderr, "[krep.c] enter main 3\n");
+    // --- getopt_long Setup ---
+    struct option long_options[] = {
+        {"color", optional_argument, 0, 'C'},     // --color[=WHEN]
+        {"no-simd", no_argument, 0, 'S'},         // --no-simd
+        {"help", no_argument, 0, 'h'},            // --help
+        {"version", no_argument, 0, 'v'},         // --version
+        {"fixed-strings", no_argument, 0, 'F'},   // --fixed-strings, same as default
+        {"regexp", required_argument, 0, 'e'},    // Treat -e as --regexp for consistency
+        {"max-count", required_argument, 0, 'm'}, // --max-count=NUM option
+        {0, 0, 0, 0}                              // Terminator
+    };
+    int option_index = 0;
+    int opt;
+
+    // Initialize max_count to SIZE_MAX (no limit)
+    params.max_count = SIZE_MAX;
+    // fprintf(stderr, "[krep.c] exit main 3\n");
+
+    fprintf(stderr, "[krep.c] enter main 4\n");
+    // --- Parse Command Line Options ---
+    while ((opt = getopt_long(argc, argv, "+e:f:icm:oEFrt:s:vhw", long_options, &option_index)) != -1)
+    {
+        fprintf(stderr, "[krep.c] enter main 5\n");
+        switch (opt)
+        {
+        case 'i': // Case-insensitive
+            fprintf(stderr, "[krep.c] enter main 6\n");
+            params.case_sensitive = false;
+            // fprintf(stderr, "[krep.c] exit main 6\n");
+            break;
+        case 'c': // Count lines
+            fprintf(stderr, "[krep.c] enter main 7\n");
+            count_only_flag = true;
+            // fprintf(stderr, "[krep.c] exit main 7\n");
+            break;
+        case 'o': // Only matching parts
+            fprintf(stderr, "[krep.c] enter main 8\n");
+            only_matching = true;
+            // fprintf(stderr, "[krep.c] exit main 8\n");
+            break;
+        case 'm': // Max count
+        {
+            fprintf(stderr, "[krep.c] enter main 9\n");
+            char *endptr = NULL;
+            errno = 0;
+            long val = strtol(optarg, &endptr, 10);
+            if (errno != 0 || optarg == endptr || *endptr != '\0' || val < 0)
+            {
+                fprintf(stderr, "[krep.c] enter main 10\n");
+                fprintf(stderr, "krep: Warning: Invalid number for max-count '%s'\n", optarg);
+                // fprintf(stderr, "[krep.c] exit main 10\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter main 11\n");
+                // Cast to size_t (always less than SIZE_MAX since we've verified val >= 0)
+                params.max_count = (size_t)val;
+                // fprintf(stderr, "[krep.c] exit main 11\n");
+            }
+            // fprintf(stderr, "[krep.c] exit main 9\n");
+        }
+        break;
+        case 'E': // Use Extended Regex
+            fprintf(stderr, "[krep.c] enter main 12\n");
+            params.use_regex = true;
+            // fprintf(stderr, "[krep.c] exit main 12\n");
+            break;
+        case 'F': // Fixed strings (explicitly, same as default)
+            fprintf(stderr, "[krep.c] enter main 13\n");
+            params.use_regex = false;
+            // fprintf(stderr, "[krep.c] exit main 13\n");
+            break;
+        case 'r': // Recursive search
+            fprintf(stderr, "[krep.c] enter main 14\n");
+            recursive_mode = true;
+            // fprintf(stderr, "[krep.c] exit main 14\n");
+            break;
+        case 't': // Set thread count
+        {
+            fprintf(stderr, "[krep.c] enter main 15\n");
+            char *endptr = NULL;
+            errno = 0;
+            long val = strtol(optarg, &endptr, 10);
+            if (errno != 0 || optarg == endptr || *endptr != '\0' || val <= 0 || val > INT_MAX)
+            {
+                fprintf(stderr, "[krep.c] enter main 16\n");
+                fprintf(stderr, "krep: Warning: Invalid thread count '%s', using default.\n", optarg);
+                thread_count = DEFAULT_THREAD_COUNT;
+                // fprintf(stderr, "[krep.c] exit main 16\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter main 17\n");
+                thread_count = (int)val;
+                // fprintf(stderr, "[krep.c] exit main 17\n");
+            }
+            // fprintf(stderr, "[krep.c] exit main 15\n");
+        }
+        break;
+        case 's': // Search string mode
+            fprintf(stderr, "[krep.c] enter main 18\n");
+            string_mode = true;
+            target_arg = optarg;
+            // fprintf(stderr, "[krep.c] exit main 18\n");
+            break;
+        case 'f': // Read patterns from file
+        {
+            fprintf(stderr, "[krep.c] enter main 19\n");
+            FILE *pattern_file = fopen(optarg, "r");
+            if (!pattern_file)
+            {
+                fprintf(stderr, "[krep.c] enter main 20\n");
+                fprintf(stderr, "krep: Error: Cannot open pattern file: %s\n", optarg);
+                return 2;
+                // fprintf(stderr, "[krep.c] exit main 20\n");
+            }
+
+            char line[MAX_PATTERN_LENGTH];
+            while (fgets(line, sizeof(line), pattern_file) && num_patterns_found < MAX_PATTERN_LENGTH)
+            {
+                fprintf(stderr, "[krep.c] enter main 21\n");
+                // Remove trailing newline if present
+                size_t len = strlen(line);
+                if (len > 0 && line[len - 1] == '\n')
+                    line[len - 1] = '\0';
+
+                // Skip empty lines
+                if (strlen(line) == 0)
+                {
+                    fprintf(stderr, "[krep.c] enter main 22\n");
+                    continue;
+                    // fprintf(stderr, "[krep.c] exit main 22\n");
+                }
+
+                // Allocate storage for the pattern
+                pattern_args[num_patterns_found] = strdup(line);
+                if (!pattern_args[num_patterns_found])
+                {
+                    fprintf(stderr, "[krep.c] enter main 23\n");
+                    perror("krep: Error: Memory allocation failed for pattern");
+                    fclose(pattern_file);
+                    return 2;
+                    // fprintf(stderr, "[krep.c] exit main 23\n");
+                }
+                pattern_lens[num_patterns_found] = strlen(pattern_args[num_patterns_found]);
+                // Mark this pattern as needing to be freed
+                pattern_needs_free[num_patterns_found] = true;
+                num_patterns_found++;
+                // fprintf(stderr, "[krep.c] exit main 21\n");
+            }
+            fclose(pattern_file);
+
+            if (num_patterns_found == 0)
+            {
+                fprintf(stderr, "[krep.c] enter main 24\n");
+                fprintf(stderr, "krep: Error: No patterns found in file: %s\n", optarg);
+                return 2;
+                // fprintf(stderr, "[krep.c] exit main 24\n");
+            }
+            // fprintf(stderr, "[krep.c] exit main 19\n");
+            break;
+        }
+
+        case 'v': // Version
+            fprintf(stderr, "[krep.c] enter main 25\n");
+            printf("krep v%s\n", VERSION);
+#if KREP_USE_AVX2
+            printf("SIMD: Compiled with AVX2 support.\n");
+#elif KREP_USE_SSE42
+            printf("SIMD: Compiled with SSE4.2 support.\n");
+#elif KREP_USE_NEON
+            printf("SIMD: Compiled with NEON support.\n");
+#else
+            printf("SIMD: Compiled without specific SIMD support.\n");
+#endif
+            printf("Max SIMD Pattern Length: %zu bytes\n", SIMD_MAX_PATTERN_LEN);
+            return 0;
+            // fprintf(stderr, "[krep.c] exit main 25\n");
+        case 'h': // Help
+            fprintf(stderr, "[krep.c] enter main 26\n");
+            print_usage(argv[0]);
+            return 0;
+            // fprintf(stderr, "[krep.c] exit main 26\n");
+        case 'e': // Specify pattern via option
+            fprintf(stderr, "[krep.c] enter main 27\n");
+            if (num_patterns_found < MAX_PATTERN_LENGTH)
+            {
+                fprintf(stderr, "[krep.c] enter main 28\n");
+                pattern_args[num_patterns_found] = optarg;
+                pattern_lens[num_patterns_found] = strlen(optarg);
+                // These patterns come from argv, no need to free
+                pattern_needs_free[num_patterns_found] = false;
+                num_patterns_found++;
+                // fprintf(stderr, "[krep.c] exit main 28\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter main 29\n");
+                fprintf(stderr, "krep: Error: Too many patterns specified (max %d)\n", MAX_PATTERN_LENGTH);
+                return 2;
+                // fprintf(stderr, "[krep.c] exit main 29\n");
+            }
+            // fprintf(stderr, "[krep.c] exit main 27\n");
+            break;
+
+        case 'C': // --color option
+            fprintf(stderr, "[krep.c] enter main 30\n");
+            if (optarg == NULL || strcmp(optarg, "auto") == 0)
+            {
+                fprintf(stderr, "[krep.c] enter main 31\n");
+                color_when = "auto";
+                // fprintf(stderr, "[krep.c] exit main 31\n");
+            }
+            else if (strcmp(optarg, "always") == 0)
+            {
+                fprintf(stderr, "[krep.c] enter main 32\n");
+                color_when = "always";
+                // fprintf(stderr, "[krep.c] exit main 32\n");
+            }
+            else if (strcmp(optarg, "never") == 0)
+            {
+                fprintf(stderr, "[krep.c] enter main 33\n");
+                color_when = "never";
+                // fprintf(stderr, "[krep.c] exit main 33\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter main 34\n");
+                fprintf(stderr, "krep: Error: Invalid argument for --color: %s\n", optarg);
+                print_usage(argv[0]);
+                return 2;
+                // fprintf(stderr, "[krep.c] exit main 34\n");
+            }
+            // fprintf(stderr, "[krep.c] exit main 30\n");
+            break;
+        case 'S': // --no-simd option
+            fprintf(stderr, "[krep.c] enter main 35\n");
+            force_no_simd = true;
+            // fprintf(stderr, "[krep.c] exit main 35\n");
+            break;
+        case 'w': // Whole word
+            fprintf(stderr, "[krep.c] enter main 36\n");
+            params.whole_word = true;
+            // fprintf(stderr, "[krep.c] exit main 36\n");
+            break;
+        case '?': // Unknown option or missing argument from getopt
+        default:  // Should not happen
+            fprintf(stderr, "[krep.c] enter main 37\n");
+            print_usage(argv[0]);
+            return 2;
+            // fprintf(stderr, "[krep.c] exit main 37\n");
+        }
+        // fprintf(stderr, "[krep.c] exit main 5\n");
+    }
+    // fprintf(stderr, "[krep.c] exit main 4\n");
+
+    fprintf(stderr, "[krep.c] enter main 38\n");
+    // --- Finalize Parameter Setup ---
+
+    // Determine color output setting
+    if (strcmp(color_when, "always") == 0)
+    {
+        fprintf(stderr, "[krep.c] enter main 39\n");
+        color_output_enabled = true;
+        // fprintf(stderr, "[krep.c] exit main 39\n");
+    }
+    else if (strcmp(color_when, "never") == 0)
+    {
+        fprintf(stderr, "[krep.c] enter main 40\n");
+        color_output_enabled = false;
+        // fprintf(stderr, "[krep.c] exit main 40\n");
+    }
+    else                                              // "auto" (default)
+    {
+        fprintf(stderr, "[krep.c] enter main 41\n");
+        color_output_enabled = isatty(STDOUT_FILENO); // Enable only if stdout is a TTY
+        // fprintf(stderr, "[krep.c] exit main 41\n");
+    }
+
+    // Get pattern argument(s)
+    if (num_patterns_found == 0)
+    { // No patterns from -e or -f
+        fprintf(stderr, "[krep.c] enter main 42\n");
+        if (optind >= argc)
+        {
+            fprintf(stderr, "[krep.c] enter main 43\n");
+            fprintf(stderr, "krep: Error: No pattern specified.\n");
+            print_usage(argv[0]);
+            return 2;
+            // fprintf(stderr, "[krep.c] exit main 43\n");
+        }
+        pattern_args[0] = argv[optind++]; // Consume the pattern argument
+        pattern_lens[0] = strlen(pattern_args[0]);
+        pattern_needs_free[0] = false; // Pattern from argv, no need to free
+        num_patterns_found = 1;
+        // fprintf(stderr, "[krep.c] exit main 42\n");
+    }
+
+    // Assign patterns to params struct
+    params.patterns = (const char **)pattern_args; // Cast is safe as we won't modify argv content
+    params.pattern_lens = pattern_lens;
+    params.num_patterns = num_patterns_found;
+    // For single pattern case, also set the legacy fields for compatibility
+    if (num_patterns_found == 1)
+    {
+        fprintf(stderr, "[krep.c] enter main 44\n");
+        params.pattern = params.patterns[0];
+        params.pattern_len = params.pattern_lens[0];
+        // fprintf(stderr, "[krep.c] exit main 44\n");
+    }
+
+    // Get target argument (file, directory, or string to search)
+    if (optind >= argc)
+    { // No more arguments left
+        fprintf(stderr, "[krep.c] enter main 45\n");
+        if (recursive_mode && !string_mode)
+        {
+            fprintf(stderr, "[krep.c] enter main 46\n");
+            target_arg = "."; // Default to current directory for -r
+            // fprintf(stderr, "[krep.c] exit main 46\n");
+        }
+        else if (!string_mode && !recursive_mode && isatty(STDIN_FILENO))
+        {
+            fprintf(stderr, "[krep.c] enter main 47\n");
+            fprintf(stderr, "krep: Error: FILE or DIRECTORY argument missing.\n");
+            print_usage(argv[0]);
+            return 2;
+            // fprintf(stderr, "[krep.c] exit main 47\n");
+        }
+        else if (!string_mode && !recursive_mode)
+        {
+            fprintf(stderr, "[krep.c] enter main 48\n");
+            target_arg = "-"; // Use "-" for stdin
+            // fprintf(stderr, "[krep.c] exit main 48\n");
+        }
+        else if (string_mode)
+        {
+            fprintf(stderr, "[krep.c] enter main 49\n");
+            fprintf(stderr, "krep: Error: STRING_TO_SEARCH argument missing for -s.\n");
+            print_usage(argv[0]);
+            return 2;
+            // fprintf(stderr, "[krep.c] exit main 49\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter main 50\n");
+            print_usage(argv[0]); // Unexpected case
+            return 2;
+            // fprintf(stderr, "[krep.c] exit main 50\n");
+        }
+        // fprintf(stderr, "[krep.c] exit main 45\n");
+    }
+    else
+    {
+        fprintf(stderr, "[krep.c] enter main 51\n");
+        target_arg = argv[optind++]; // Target is the next argument
+        // fprintf(stderr, "[krep.c] exit main 51\n");
+    }
+
+    // Check for extra arguments
+    if (optind < argc)
+    {
+        fprintf(stderr, "[krep.c] enter main 52\n");
+        fprintf(stderr, "krep: Error: Extra arguments provided ('%s'...). \n", argv[optind]);
+        print_usage(argv[0]);
+        return 2;
+        // fprintf(stderr, "[krep.c] exit main 52\n");
+    }
+
+    // Validate incompatible options
+    if (string_mode && recursive_mode)
+    {
+        fprintf(stderr, "[krep.c] enter main 53\n");
+        fprintf(stderr, "krep: Error: Options -s (search string) and -r (recursive) cannot be used together.\n");
+        print_usage(argv[0]);
+        return 2;
+        // fprintf(stderr, "[krep.c] exit main 53\n");
+    }
+
+    // Set final counting/tracking modes in params
+    params.count_lines_mode = count_only_flag && !only_matching;  // -c only
+    params.count_matches_mode = count_only_flag && only_matching; // -co (internal concept, currently unused externally)
+    // Track positions unless only counting lines (-c without -o)
+    params.track_positions = !(count_only_flag && !only_matching);
+    // fprintf(stderr, "[krep.c] exit main 38\n");
+
+    fprintf(stderr, "[krep.c] enter main 54\n");
+    // --- Execute Search ---
+    int exit_code = 1; /* No match found by default */
+
+    if (string_mode)
+    {
+        fprintf(stderr, "[krep.c] enter main 55\n");
+        // Search the provided string argument
+        exit_code = search_string(&params, target_arg);
+        // fprintf(stderr, "[krep.c] exit main 55\n");
+    }
+    else if (recursive_mode)
+    {
+        fprintf(stderr, "[krep.c] enter main 56\n");
+        // Search recursively starting from the target directory
+        struct stat target_stat;
+        if (stat(target_arg, &target_stat) == -1)
+        {
+            fprintf(stderr, "[krep.c] enter main 57\n");
+            fprintf(stderr, "krep: %s: %s\n", target_arg, strerror(errno));
+            return 2; // Target does not exist or other stat error
+            // fprintf(stderr, "[krep.c] exit main 57\n");
+        }
+        if (!S_ISDIR(target_stat.st_mode))
+        {
+            fprintf(stderr, "[krep.c] enter main 58\n");
+            fprintf(stderr, "krep: %s: Is not a directory (required for -r)\n", target_arg);
+            return 2;
+            // fprintf(stderr, "[krep.c] exit main 58\n");
+        }
+        atomic_store(&global_match_found_flag, false); // Reset global flag
+        int errors = search_directory_recursive(target_arg, &params, thread_count);
+        if (errors > 0)
+        {
+            fprintf(stderr, "[krep.c] enter main 59\n");
+            fprintf(stderr, "krep: Encountered %d errors during recursive search.\n", errors);
+            exit_code = 2; // Exit code 2 if errors occurred
+            // fprintf(stderr, "[krep.c] exit main 59\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter main 60\n");
+            exit_code = atomic_load(&global_match_found_flag) ? 0 : 1; // 0 if matches found, 1 otherwise
+            // fprintf(stderr, "[krep.c] exit main 60\n");
+        }
+        // fprintf(stderr, "[krep.c] exit main 56\n");
+    }
+    else
+    { // Single target (file or stdin)
+        fprintf(stderr, "[krep.c] enter main 61\n");
+        // search_file handles stdin internally if target_arg is "-"
+        struct stat target_stat;
+        // If not stdin, check if it's a directory without -r
+        if (strcmp(target_arg, "-") != 0 && stat(target_arg, &target_stat) == 0 && S_ISDIR(target_stat.st_mode))
+        {
+            fprintf(stderr, "[krep.c] enter main 62\n");
+            fprintf(stderr, "krep: %s: Is a directory (use -r to search directories)\n", target_arg);
+            return 2;
+            // fprintf(stderr, "[krep.c] exit main 62\n");
+        }
+        // Call search_file (handles stdin via target_arg == "-")
+        exit_code = search_file(&params, target_arg, thread_count);
+        // fprintf(stderr, "[krep.c] exit main 61\n");
+    }
+    // fprintf(stderr, "[krep.c] exit main 54\n");
+
+    fprintf(stderr, "[krep.c] enter main 63\n");
+    // Cleanup before exit - free any memory allocated for patterns read from file
+    if (num_patterns_found > 0)
+    {
+        fprintf(stderr, "[krep.c] enter main 64\n");
+        for (size_t i = 0; i < num_patterns_found; i++)
+        {
+            fprintf(stderr, "[krep.c] enter main 65\n");
+            if (pattern_needs_free[i] && pattern_args[i])
+            {
+                fprintf(stderr, "[krep.c] enter main 66\n");
+                free(pattern_args[i]);
+                // fprintf(stderr, "[krep.c] exit main 66\n");
+            }
+            // fprintf(stderr, "[krep.c] exit main 65\n");
+        }
+        // fprintf(stderr, "[krep.c] exit main 64\n");
+    }
+
+    // Return the final exit code (0=match, 1=no match, 2=error)
+    return exit_code;
+    // fprintf(stderr, "[krep.c] exit main 63\n");
+}
+#endif // !defined(TESTING)
+
+// Add near the other search functions
+uint64_t memchr_search(const search_params_t *params,
+                       const char *text_start,
+                       size_t text_len,
+                       match_result_t *result)
+{
+    fprintf(stderr, "[krep.c] enter memchr_search 1\n");
+    // --- Add max_count == 0 check ---
+    if (params->max_count == 0)
+        return 0;
+    // --- End add ---
+    // fprintf(stderr, "[krep.c] exit memchr_search 1\n");
+
+    fprintf(stderr, "[krep.c] enter memchr_search 2\n");
+    uint64_t current_count = 0;             // Use local counter for limit check
+    const char target = params->pattern[0]; // Single byte pattern
+    const char target_case = params->case_sensitive ? 0 : (islower(target) ? toupper(target) : tolower(target));
+    bool count_lines_mode = params->count_lines_mode;
+    bool track_positions = params->track_positions;
+    size_t max_count = params->max_count; // Get max_count
+
+// Special batched buffer for matches to reduce malloc overhead
+#define MEMCHR_BUFFER_SIZE 4096
+    match_position_t local_buffer[MEMCHR_BUFFER_SIZE];
+    size_t buffer_count = 0;
+
+    size_t last_counted_line_start = SIZE_MAX;
+    size_t pos = 0;
+    // fprintf(stderr, "[krep.c] exit memchr_search 2\n");
+
+    // Fast byte-by-byte scan
+    while (pos < text_len)
+    {
+        fprintf(stderr, "[krep.c] enter memchr_search 3\n");
+        const char *found;
+
+        // Use platform-optimized memchr
+        found = memchr(text_start + pos, target, text_len - pos);
+
+        // Handle case insensitive - we need to check both cases
+        if (!params->case_sensitive && !found && target_case != target)
+        {
+            fprintf(stderr, "[krep.c] enter memchr_search 4\n");
+            found = memchr(text_start + pos, target_case, text_len - pos);
+            // fprintf(stderr, "[krep.c] exit memchr_search 4\n");
+        }
+
+        if (!found)
+        {
+            fprintf(stderr, "[krep.c] enter memchr_search 5\n");
+            break;
+            // fprintf(stderr, "[krep.c] exit memchr_search 5\n");
+        }
+        // fprintf(stderr, "[krep.c] exit memchr_search 3\n");
+
+        fprintf(stderr, "[krep.c] enter memchr_search 6\n");
+        // Calculate absolute position
+        size_t match_pos = found - text_start;
+
+        // Match found at match_pos
+        // Whole word check
+        if (params->whole_word && !is_whole_word_match(text_start, text_len, match_pos, match_pos + 1))
+        {
+            fprintf(stderr, "[krep.c] enter memchr_search 7\n");
+            pos = match_pos + 1;
+            continue;
+            // fprintf(stderr, "[krep.c] exit memchr_search 7\n");
+        }
+        // fprintf(stderr, "[krep.c] exit memchr_search 6\n");
+
+        fprintf(stderr, "[krep.c] enter memchr_search 8\n");
+        if (count_lines_mode)
+        {
+            fprintf(stderr, "[krep.c] enter memchr_search 9\n");
+            size_t line_start = find_line_start(text_start, text_len, match_pos);
+            if (line_start != last_counted_line_start)
+            {
+                fprintf(stderr, "[krep.c] enter memchr_search 10\n");
+                // --- Check max_count BEFORE incrementing ---
+                if (max_count != SIZE_MAX && current_count >= max_count)
+                {
+                    fprintf(stderr, "[krep.c] enter memchr_search 11\n");
+                    break; // Limit reached
+                    // fprintf(stderr, "[krep.c] exit memchr_search 11\n");
+                }
+                // --- End check ---
+
+                current_count++; // Increment line count
+                last_counted_line_start = line_start;
+
+                // Optimize: skip to end of line
+                size_t line_end = find_line_end(text_start, text_len, line_start);
+                pos = (line_end < text_len) ? line_end + 1 : text_len;
+                // fprintf(stderr, "[krep.c] exit memchr_search 10\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter memchr_search 12\n");
+                pos = match_pos + 1;
+                // fprintf(stderr, "[krep.c] exit memchr_search 12\n");
+            }
+            // fprintf(stderr, "[krep.c] exit memchr_search 9\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter memchr_search 13\n");
+            // --- Check max_count BEFORE incrementing ---
+            if (max_count != SIZE_MAX && current_count >= max_count)
+            {
+                fprintf(stderr, "[krep.c] enter memchr_search 14\n");
+                if (track_positions && result) // Add final match to buffer/result
+                {
+                    fprintf(stderr, "[krep.c] enter memchr_search 15\n");
+                    if (buffer_count < MEMCHR_BUFFER_SIZE)
+                    {
+                        fprintf(stderr, "[krep.c] enter memchr_search 16\n");
+                        local_buffer[buffer_count].start_offset = match_pos;
+                        local_buffer[buffer_count].end_offset = match_pos + 1;
+                        buffer_count++;
+                        // fprintf(stderr, "[krep.c] exit memchr_search 16\n");
+                    }
+                    else if (!match_result_add(result, match_pos, match_pos + 1))
+                    {
+                        fprintf(stderr, "[krep.c] enter memchr_search 17\n");
+                        fprintf(stderr, "Warning: Failed to add SSE4.2 match position.\n");
+                        // fprintf(stderr, "[krep.c] exit memchr_search 17\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit memchr_search 15\n");
+                }
+                break; // Limit reached
+                // fprintf(stderr, "[krep.c] exit memchr_search 14\n");
+            }
+            // --- End check ---
+
+            current_count++; // Increment match count
+
+            if (track_positions && result)
+            {
+                fprintf(stderr, "[krep.c] enter memchr_search 18\n");
+                if (buffer_count < MEMCHR_BUFFER_SIZE)
+                {
+                    fprintf(stderr, "[krep.c] enter memchr_search 19\n");
+                    // Store in local buffer
+                    local_buffer[buffer_count].start_offset = match_pos;
+                    local_buffer[buffer_count].end_offset = match_pos + 1;
+                    buffer_count++;
+                    // fprintf(stderr, "[krep.c] exit memchr_search 19\n");
+                }
+                else
+                {
+                    fprintf(stderr, "[krep.c] enter memchr_search 20\n");
+                    // Flush buffer to result
+                    for (size_t i = 0; i < buffer_count; i++)
+                    {
+                        fprintf(stderr, "[krep.c] enter memchr_search 21\n");
+                        match_result_add(result, local_buffer[i].start_offset,
+                                         local_buffer[i].end_offset);
+                        // fprintf(stderr, "[krep.c] exit memchr_search 21\n");
+                    }
+                    buffer_count = 0;
+                    // Add current match to buffer
+                    local_buffer[buffer_count].start_offset = match_pos;
+                    local_buffer[buffer_count].end_offset = match_pos + 1;
+                    buffer_count++;
+                    // fprintf(stderr, "[krep.c] exit memchr_search 20\n");
+                }
+                // fprintf(stderr, "[krep.c] exit memchr_search 18\n");
+            }
+            pos = match_pos + 1;
+            // fprintf(stderr, "[krep.c] exit memchr_search 13\n");
+        }
+        // fprintf(stderr, "[krep.c] exit memchr_search 8\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter memchr_search 22\n");
+    // Flush any remaining buffer entries
+    if (track_positions && result && buffer_count > 0)
+    {
+        fprintf(stderr, "[krep.c] enter memchr_search 23\n");
+        // Respect max_count when flushing remaining buffer
+        uint64_t already_added = result->count;
+        uint64_t can_add_more = (max_count == SIZE_MAX) ? buffer_count : ((already_added >= max_count) ? 0 : max_count - already_added);
+        size_t flush_limit = (buffer_count < can_add_more) ? buffer_count : can_add_more;
+
+        for (size_t i = 0; i < flush_limit; i++)
+        {
+            fprintf(stderr, "[krep.c] enter memchr_search 24\n");
+            match_result_add(result, local_buffer[i].start_offset,
+                             local_buffer[i].end_offset);
+            // fprintf(stderr, "[krep.c] exit memchr_search 24\n");
+        }
+        // fprintf(stderr, "[krep.c] exit memchr_search 23\n");
+    }
+
+    return current_count; // Return line count or match count
+    // fprintf(stderr, "[krep.c] exit memchr_search 22\n");
+}
+
+
+// --- memchr-based search for short patterns (2-3 chars) ---
+uint64_t memchr_short_search(const search_params_t *params,
+                             const char *text_start,
+                             size_t text_len,
+                             match_result_t *result)
+{
+    fprintf(stderr, "[krep.c] enter memchr_short_search 1\n");
+    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
+        return 0;
+    // fprintf(stderr, "[krep.c] exit memchr_short_search 1\n");
+
+    fprintf(stderr, "[krep.c] enter memchr_short_search 2\n");
+    uint64_t current_count = 0;
+    size_t pattern_len = params->pattern_len;
+    const unsigned char *search_pattern = (const unsigned char *)params->pattern;
+    bool case_sensitive = params->case_sensitive;
+    bool count_lines_mode = params->count_lines_mode;
+    bool track_positions = params->track_positions;
+    size_t max_count = params->max_count;
+
+    if (pattern_len < 2 || pattern_len > 3 || text_len < pattern_len)
+        return 0;
+
+    const char *current_pos = text_start;
+    size_t remaining_len = text_len;
+    size_t last_counted_line_start = SIZE_MAX;
+    unsigned char first_char = search_pattern[0];
+    unsigned char first_char_lower = case_sensitive ? 0 : lower_table[first_char];
+    // fprintf(stderr, "[krep.c] exit memchr_short_search 2\n");
+
+    while (remaining_len >= pattern_len)
+    {
+        fprintf(stderr, "[krep.c] enter memchr_short_search 3\n");
+        const char *potential_match = NULL;
+        if (case_sensitive)
+        {
+            fprintf(stderr, "[krep.c] enter memchr_short_search 4\n");
+            potential_match = memchr(current_pos, first_char, remaining_len - pattern_len + 1);
+            // fprintf(stderr, "[krep.c] exit memchr_short_search 4\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter memchr_short_search 5\n");
+            const unsigned char *scan = (const unsigned char *)current_pos;
+            for (size_t k = 0; k <= remaining_len - pattern_len; ++k)
+            {
+                fprintf(stderr, "[krep.c] enter memchr_short_search 6\n");
+                if (lower_table[scan[k]] == first_char_lower)
+                {
+                    fprintf(stderr, "[krep.c] enter memchr_short_search 7\n");
+                    potential_match = (const char *)(scan + k);
+                    break;
+                    // fprintf(stderr, "[krep.c] exit memchr_short_search 7\n");
+                }
+                // fprintf(stderr, "[krep.c] exit memchr_short_search 6\n");
+            }
+            // fprintf(stderr, "[krep.c] exit memchr_short_search 5\n");
+        }
+        // fprintf(stderr, "[krep.c] exit memchr_short_search 3\n");
+
+        fprintf(stderr, "[krep.c] enter memchr_short_search 8\n");
+        if (potential_match == NULL)
+        {
+            fprintf(stderr, "[krep.c] enter memchr_short_search 9\n");
+            break;
+            // fprintf(stderr, "[krep.c] exit memchr_short_search 9\n");
+        }
+        // fprintf(stderr, "[krep.c] exit memchr_short_search 8\n");
+
+        fprintf(stderr, "[krep.c] enter memchr_short_search 10\n");
+        bool full_match = false;
+        if (case_sensitive)
+        {
+            fprintf(stderr, "[krep.c] enter memchr_short_search 11\n");
+            if (memcmp(potential_match + 1, search_pattern + 1, pattern_len - 1) == 0)
+            {
+                fprintf(stderr, "[krep.c] enter memchr_short_search 12\n");
+                full_match = true;
+                // fprintf(stderr, "[krep.c] exit memchr_short_search 12\n");
+            }
+            // fprintf(stderr, "[krep.c] exit memchr_short_search 11\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter memchr_short_search 13\n");
+            if (memory_equals_case_insensitive((const unsigned char *)potential_match + 1, search_pattern + 1, pattern_len - 1))
+            {
+                fprintf(stderr, "[krep.c] enter memchr_short_search 14\n");
+                full_match = true;
+                // fprintf(stderr, "[krep.c] exit memchr_short_search 14\n");
+            }
+            // fprintf(stderr, "[krep.c] exit memchr_short_search 13\n");
+        }
+        // fprintf(stderr, "[krep.c] exit memchr_short_search 10\n");
+
+        fprintf(stderr, "[krep.c] enter memchr_short_search 15\n");
+        if (full_match)
+        {
+            fprintf(stderr, "[krep.c] enter memchr_short_search 16\n");
+            size_t match_start_offset = potential_match - text_start;
+            // Whole word check
+            if (params->whole_word && !is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
+            {
+                fprintf(stderr, "[krep.c] enter memchr_short_search 17\n");
+                current_pos = potential_match + 1;
+                remaining_len -= (potential_match - current_pos) + 1;
+                continue;
+                // fprintf(stderr, "[krep.c] exit memchr_short_search 17\n");
+            }
+
+            bool count_incremented_this_match = false;
+
+            if (count_lines_mode)
+            {
+                fprintf(stderr, "[krep.c] enter memchr_short_search 18\n");
+                size_t line_start = find_line_start(text_start, text_len, match_start_offset);
+                if (line_start != last_counted_line_start)
+                {
+                    fprintf(stderr, "[krep.c] enter memchr_short_search 19\n");
+                    current_count++;
+                    last_counted_line_start = line_start;
+                    count_incremented_this_match = true;
+                    // fprintf(stderr, "[krep.c] exit memchr_short_search 19\n");
+                }
+                // fprintf(stderr, "[krep.c] exit memchr_short_search 18\n");
+            }
+            else
+            {
+                fprintf(stderr, "[krep.c] enter memchr_short_search 20\n");
+                current_count++;
+                count_incremented_this_match = true;
+                if (track_positions && result)
+                {
+                    fprintf(stderr, "[krep.c] enter memchr_short_search 21\n");
+                    if (current_count <= max_count)
+                    {
+                        fprintf(stderr, "[krep.c] enter memchr_short_search 22\n");
+                        if (!match_result_add(result, match_start_offset, match_start_offset + pattern_len))
+                        {
+                            fprintf(stderr, "[krep.c] enter memchr_short_search 23\n");
+                            fprintf(stderr, "Warning: Failed to add short match position.\n");
+                            // fprintf(stderr, "[krep.c] exit memchr_short_search 23\n");
+                        }
+                        // fprintf(stderr, "[krep.c] exit memchr_short_search 22\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit memchr_short_search 21\n");
+                }
+                // fprintf(stderr, "[krep.c] exit memchr_short_search 20\n");
+            }
+
+            if (count_incremented_this_match && current_count >= max_count)
+            {
+                fprintf(stderr, "[krep.c] enter memchr_short_search 24\n");
+                break;
+                // fprintf(stderr, "[krep.c] exit memchr_short_search 24\n");
+            }
+            // fprintf(stderr, "[krep.c] exit memchr_short_search 16\n");
+        }
+        // fprintf(stderr, "[krep.c] exit memchr_short_search 15\n");
+
+        fprintf(stderr, "[krep.c] enter memchr_short_search 25\n");
+        size_t advance = (potential_match - current_pos) + (only_matching ? pattern_len : 1);
+        if (advance > remaining_len)
+        {
+            fprintf(stderr, "[krep.c] enter memchr_short_search 26\n");
+            break;
+            // fprintf(stderr, "[krep.c] exit memchr_short_search 26\n");
+        }
+        current_pos += advance;
+        remaining_len -= advance;
+        // fprintf(stderr, "[krep.c] exit memchr_short_search 25\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter memchr_short_search 27\n");
+    return current_count;
+    // fprintf(stderr, "[krep.c] exit memchr_short_search 27\n");
+}
+
+#ifdef __ARM_NEON
+uint64_t neon_search(const search_params_t *params,
+                     const char *text_start,
+                     size_t text_len,
+                     match_result_t *result)
+{
+    fprintf(stderr, "[krep.c] enter neon_search 1\n");
+    if (params->pattern_len > 16 || !params->case_sensitive)
+    {
+        fprintf(stderr, "[krep.c] enter neon_search 2\n");
+        return boyer_moore_search(params, text_start, text_len, result);
+        // fprintf(stderr, "[krep.c] exit neon_search 2\n");
+    }
+
+    return boyer_moore_search(params, text_start, text_len, result);
+    // fprintf(stderr, "[krep.c] exit neon_search 1\n");
+}
+#endif
+
+// --- SIMD Implementations (Placeholders/Actual) ---
+#if KREP_USE_SSE42
+// SSE4.2 search function using _mm_cmpestri
+// Handles case-sensitive patterns up to 16 bytes.
+uint64_t simd_sse42_search(const search_params_t *params,
+                           const char *text_start,
+                           size_t text_len,
+                           match_result_t *result)
+{
+    fprintf(stderr, "\n");
+    // Precondition checks
+    if (params->pattern_len == 0 || params->pattern_len > 16 || !params->case_sensitive || text_len < params->pattern_len)
+    {
+        fprintf(stderr, "[krep.c] enter simd_sse42_search 2\n");
+        // Fallback if preconditions not met
+        return boyer_moore_search(params, text_start, text_len, result);
+        // fprintf(stderr, "[krep.c] exit simd_sse42_search 2\n");
+    }
+    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
+    {
+        fprintf(stderr, "[krep.c] enter simd_sse42_search 3\n");
+        return 0;
+        // fprintf(stderr, "[krep.c] exit simd_sse42_search 3\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter simd_sse42_search 4\n");
+    uint64_t current_count = 0;
+    size_t pattern_len = params->pattern_len;
+    const char *pattern = params->pattern;
+    bool count_lines_mode = params->count_lines_mode;
+    bool track_positions = params->track_positions;
+    size_t max_count = params->max_count;
+    size_t last_counted_line_start = SIZE_MAX;
+
+    // Load the pattern into an XMM register
+    __m128i pattern_vec = _mm_loadu_si128((const __m128i *)pattern);
+
+    const char *current_pos = text_start;
+    size_t remaining_len = text_len;
+
+    // Mode for _mm_cmpestri: compare strings, return index, positive polarity
+    // Using an enum for constant folding to work with optimizations off
+    enum
+    {
+        cmp_mode = _SIDD_CMP_EQUAL_ORDERED | _SIDD_POSITIVE_POLARITY | _SIDD_LEAST_SIGNIFICANT
+    };
+    // fprintf(stderr, "[krep.c] exit simd_sse42_search 4\n");
+
+    while (remaining_len >= pattern_len)
+    {
+        fprintf(stderr, "[krep.c] enter simd_sse42_search 5\n");
+        // Determine chunk size (max 16 bytes for _mm_cmpestri)
+        size_t chunk_len = (remaining_len < 16) ? remaining_len : 16;
+
+        // Load text chunk into an XMM register - SAFELY
+        __m128i text_vec;
+        if (chunk_len < 16)
+        {
+            fprintf(stderr, "[krep.c] enter simd_sse42_search 6\n");
+            // For smaller chunks, use a buffer to avoid reading past the end
+            char safe_buffer[16] = {0}; // Zero-initialized
+            memcpy(safe_buffer, current_pos, chunk_len);
+            text_vec = _mm_loadu_si128((const __m128i *)safe_buffer);
+            // fprintf(stderr, "[krep.c] exit simd_sse42_search 6\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter simd_sse42_search 7\n");
+            text_vec = _mm_loadu_si128((const __m128i *)current_pos);
+            // fprintf(stderr, "[krep.c] exit simd_sse42_search 7\n");
+        }
+
+        fprintf(stderr, "[krep.c] enter simd_sse42_search 8\n");
+        // Compare pattern against the text chunk
+        // _mm_cmpestri returns the index of the first byte of the first match
+        // or chunk_len if no match is found within the chunk.
+        int index = _mm_cmpestri(pattern_vec, pattern_len, text_vec, chunk_len, cmp_mode);
+        // fprintf(stderr, "[krep.c] exit simd_sse42_search 8\n");
+
+        if (index < (int)(chunk_len - pattern_len + 1))
+        {
+            fprintf(stderr, "[krep.c] enter simd_sse42_search 9\n");
+            // Match found within the current 16-byte window at 'index'
+            size_t match_start_offset = (current_pos - text_start) + index;
+
+            // Fast path: skip whole word check if not needed
+            if (!params->whole_word || is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
+            {
+                fprintf(stderr, "[krep.c] enter simd_sse42_search 10\n");
+                bool count_incremented_this_match = false;
+
+                if (count_lines_mode)
+                {
+                    fprintf(stderr, "[krep.c] enter simd_sse42_search 11\n");
+                    // Cache the line start position to avoid repeated calculations
+                    size_t line_start = find_line_start(text_start, text_len, match_start_offset);
+                    if (line_start != last_counted_line_start)
+                    {
+                        fprintf(stderr, "[krep.c] enter simd_sse42_search 12\n");
+                        // Check max count before incrementing
+                        if (current_count >= max_count)
+                        {
+                            fprintf(stderr, "[krep.c] enter simd_sse42_search 13\n");
+                            break;
+                            // fprintf(stderr, "[krep.c] exit simd_sse42_search 13\n");
+                        }
+
+                        fprintf(stderr, "[krep.c] enter simd_sse42_search 14\n");
+                        current_count++;
+                        last_counted_line_start = line_start;
+                        count_incremented_this_match = true;
+
+                        // Optimize: advance to next line after counting this one
+                        size_t line_end = find_line_end(text_start, text_len, line_start);
+                        if (line_end < text_len)
+                        {
+                            fprintf(stderr, "[krep.c] enter simd_sse42_search 15\n");
+                            // Convert to offsets from text_start to fix pointer arithmetic
+                            size_t current_offset = (current_pos - text_start) + index;
+                            size_t advance = (line_end + 1) - current_offset;
+                            if (advance > 0)
+                            {
+                                fprintf(stderr, "[krep.c] enter simd_sse42_search 16\n");
+                                current_pos += advance;
+                                remaining_len -= advance;
+                                continue;
+                                // fprintf(stderr, "[krep.c] exit simd_sse42_search 16\n");
+                            }
+                            // fprintf(stderr, "[krep.c] exit simd_sse42_search 15\n");
+                        }
+                        // fprintf(stderr, "[krep.c] exit simd_sse42_search 14\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit simd_sse42_search 12\n");
+                    // fprintf(stderr, "[krep.c] exit simd_sse42_search 11\n");
+                }
+                else
+                {
+                    fprintf(stderr, "[krep.c] enter simd_sse42_search 17\n");
+                    // Check max count before incrementing
+                    if (current_count >= max_count)
+                    {
+                        fprintf(stderr, "[krep.c] enter simd_sse42_search 18\n");
+                        break;
+                        // fprintf(stderr, "[krep.c] exit simd_sse42_search 18\n");
+                    }
+
+                    fprintf(stderr, "[krep.c] enter simd_sse42_search 19\n");
+                    current_count++;
+                    count_incremented_this_match = true;
+
+                    if (track_positions && result)
+                    {
+                        fprintf(stderr, "[krep.c] enter simd_sse42_search 20\n");
+                        // Add position only if still within max_count
+                        if (current_count <= max_count)
+                        {
+                            fprintf(stderr, "[krep.c] enter simd_sse42_search 21\n");
+                            // Minimize error checking in tight loop for better performance
+                            if (result->count < result->capacity)
+                            {
+                                fprintf(stderr, "[krep.c] enter simd_sse42_search 22\n");
+                                result->positions[result->count].start_offset = match_start_offset;
+                                result->positions[result->count].end_offset = match_start_offset + pattern_len;
+                                result->count++;
+                                // fprintf(stderr, "[krep.c] exit simd_sse42_search 22\n");
+                            }
+                            else if (!match_result_add(result, match_start_offset, match_start_offset + pattern_len))
+                            {
+                                fprintf(stderr, "[krep.c] enter simd_sse42_search 23\n");
+                                fprintf(stderr, "Warning: Failed to add SSE4.2 match position.\n");
+                                // fprintf(stderr, "[krep.c] exit simd_sse42_search 23\n");
+                            }
+                            // fprintf(stderr, "[krep.c] exit simd_sse42_search 21\n");
+                        }
+                        // fprintf(stderr, "[krep.c] exit simd_sse42_search 20\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit simd_sse42_search 19\n");
+                    // fprintf(stderr, "[krep.c] exit simd_sse42_search 17\n");
+                }
+
+                fprintf(stderr, "[krep.c] enter simd_sse42_search 24\n");
+                // Early break if max count reached
+                if (count_incremented_this_match && current_count >= max_count)
+                {
+                    fprintf(stderr, "[krep.c] enter simd_sse42_search 25\n");
+                    break;
+                    // fprintf(stderr, "[krep.c] exit simd_sse42_search 25\n");
+                }
+                // fprintf(stderr, "[krep.c] exit simd_sse42_search 24\n");
+                // fprintf(stderr, "[krep.c] exit simd_sse42_search 10\n");
+            }
+
+            fprintf(stderr, "[krep.c] enter simd_sse42_search 26\n");
+            // More aggressive advancement strategy
+            // Advance to just after the match instead of just by one byte
+            size_t advance = index + 1;
+
+            // If not looking for overlapping matches, can advance by pattern length
+            if (!only_matching)
+            { // only_matching mode needs to find overlapping matches
+                fprintf(stderr, "[krep.c] enter simd_sse42_search 27\n");
+                advance = index + pattern_len;
+                // Ensure we don't advance too far if near end
+                if (advance > remaining_len)
+                {
+                    fprintf(stderr, "[krep.c] enter simd_sse42_search 28\n");
+                    advance = remaining_len;
+                    // fprintf(stderr, "[krep.c] exit simd_sse42_search 28\n");
+                }
+                // fprintf(stderr, "[krep.c] exit simd_sse42_search 27\n");
+            }
+
+            fprintf(stderr, "[krep.c] enter simd_sse42_search 29\n");
+            current_pos += advance;
+            remaining_len -= advance;
+            // fprintf(stderr, "[krep.c] exit simd_sse42_search 29\n");
+            // fprintf(stderr, "[krep.c] exit simd_sse42_search 26\n");
+            // fprintf(stderr, "[krep.c] exit simd_sse42_search 9\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter simd_sse42_search 30\n");
+            // No match found in this chunk. Advance more aggressively.
+            // Jump by almost the full chunk size, leaving just enough overlap
+            // for potential matches that span chunk boundaries.
+            size_t advance = chunk_len > pattern_len ? chunk_len - pattern_len + 1 : 1;
+            // Ensure we don't advance beyond text bounds
+            if (advance > remaining_len)
+            {
+                fprintf(stderr, "[krep.c] enter simd_sse42_search 31\n");
+                advance = remaining_len;
+                // fprintf(stderr, "[krep.c] exit simd_sse42_search 31\n");
+            }
+
+            fprintf(stderr, "[krep.c] enter simd_sse42_search 32\n");
+            current_pos += advance;
+            remaining_len -= advance;
+            // fprintf(stderr, "[krep.c] exit simd_sse42_search 32\n");
+            // fprintf(stderr, "[krep.c] exit simd_sse42_search 30\n");
+        }
+        // fprintf(stderr, "[krep.c] exit simd_sse42_search 5\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter simd_sse42_search 33\n");
+    return current_count;
+    // fprintf(stderr, "[krep.c] exit simd_sse42_search 33\n");
+}
+#endif
+
+#if KREP_USE_AVX2
+// AVX2 search function
+// Handles case-sensitive patterns up to 32 bytes.
+// Uses SSE4.2 logic for patterns <= 16 bytes.
+// Uses a simplified first/last byte check for patterns > 16 bytes.
+uint64_t simd_avx2_search(const search_params_t *params,
+                          const char *text_start,
+                          size_t text_len,
+                          match_result_t *result)
+{
+    fprintf(stderr, "\n");
+    // Precondition checks
+    if (params->pattern_len == 0 || params->pattern_len > 32 || !params->case_sensitive || text_len < params->pattern_len)
+    {
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 2\n");
+        return boyer_moore_search(params, text_start, text_len, result);
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 2\n");
+    }
+    if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
+    {
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 3\n");
+        return 0;
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 3\n");
+    }
+
+    // Use SSE4.2 logic if pattern fits and SSE4.2 is available
+#if KREP_USE_SSE42
+    if (params->pattern_len <= 16)
+    {
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 4\n");
+        return simd_sse42_search(params, text_start, text_len, result);
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 4\n");
+    }
+#endif
+
+    fprintf(stderr, "[krep.c] enter simd_avx2_search 5\n");
+    // --- AVX2 specific logic for pattern_len > 16 and <= 32 ---
+    uint64_t current_count = 0;
+    size_t pattern_len = params->pattern_len;
+    const char *pattern = params->pattern;
+    bool count_lines_mode = params->count_lines_mode;
+    bool track_positions = params->track_positions;
+    size_t max_count = params->max_count;
+    size_t last_counted_line_start = SIZE_MAX;
+
+    // Create vectors for the first and last bytes of the pattern
+    __m256i first_byte_vec = _mm256_set1_epi8(pattern[0]);
+    __m256i last_byte_vec = _mm256_set1_epi8(pattern[pattern_len - 1]);
+
+    const char *current_pos = text_start;
+    size_t remaining_len = text_len;
+    // fprintf(stderr, "[krep.c] exit simd_avx2_search 5\n");
+
+    while (remaining_len >= 32) // Process in 32-byte chunks
+    {
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 6\n");
+        // Load 32 bytes of text - SAFELY
+        __m256i text_vec;
+        if (remaining_len < 32)
+        {
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 7\n");
+            // For smaller chunks, use a buffer to avoid reading past the end
+            char safe_buffer[32] = {0}; // Zero-initialized
+            memcpy(safe_buffer, current_pos, remaining_len);
+            text_vec = _mm256_loadu_si256((const __m256i *)safe_buffer);
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 7\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 8\n");
+            text_vec = _mm256_loadu_si256((const __m256i *)current_pos);
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 8\n");
+        }
+
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 9\n");
+        // Compare first byte of pattern with text
+        __m256i first_cmp = _mm256_cmpeq_epi8(first_byte_vec, text_vec);
+
+        // Compare last byte of pattern with text shifted by pattern_len - 1
+        // This requires loading potentially unaligned data for the last byte comparison
+        // SAFELY handle this load too
+        __m256i text_last_byte_vec;
+        size_t last_byte_offset = pattern_len - 1;
+        size_t bytes_available = remaining_len > last_byte_offset ? remaining_len - last_byte_offset : 0;
+
+        if (bytes_available < 32)
+        {
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 10\n");
+            char safe_buffer[32] = {0}; // Zero-initialized
+            size_t copy_size = bytes_available < remaining_len ? bytes_available : remaining_len;
+            memcpy(safe_buffer, current_pos + last_byte_offset, copy_size);
+            text_last_byte_vec = _mm256_loadu_si256((const __m256i *)safe_buffer);
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 10\n");
+        }
+        else
+        {
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 11\n");
+            text_last_byte_vec = _mm256_loadu_si256((const __m256i *)(current_pos + last_byte_offset));
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 11\n");
+        }
+        
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 12\n");
+        __m256i last_cmp = _mm256_cmpeq_epi8(last_byte_vec, text_last_byte_vec);
+
+        // Combine the masks: a potential match starts where both first and last bytes match
+        // Note: _mm256_and_si256 operates on the comparison results directly
+        // We need the mask of indices where *both* comparisons are true.
+        // Get integer masks
+        uint32_t first_mask = _mm256_movemask_epi8(first_cmp);
+        // The last_mask needs to correspond to the *start* position of the potential match
+        uint32_t last_mask = _mm256_movemask_epi8(last_cmp);
+
+        // Combine masks: potential match starts at index 'i' if bit 'i' is set in both masks.
+        uint32_t potential_starts_mask = first_mask & last_mask;
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 12\n");
+
+        // Iterate through potential start positions indicated by the combined mask
+        while (potential_starts_mask != 0)
+        {
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 13\n");
+            // Find the index of the lowest set bit (potential match start)
+            int index = __builtin_ctz(potential_starts_mask); // Use compiler intrinsic for count trailing zeros
+
+            // Verify the full pattern match at this position
+            if (memcmp(current_pos + index, pattern, pattern_len) == 0)
+            {
+                fprintf(stderr, "[krep.c] enter simd_avx2_search 14\n");
+                // Full match confirmed
+                size_t match_start_offset = (current_pos - text_start) + index;
+                // Whole word check
+                if (params->whole_word && !is_whole_word_match(text_start, text_len, match_start_offset, match_start_offset + pattern_len))
+                {
+                    fprintf(stderr, "[krep.c] enter simd_avx2_search 15\n");
+                    potential_starts_mask &= potential_starts_mask - 1;
+                    continue;
+                    // fprintf(stderr, "[krep.c] exit simd_avx2_search 15\n");
+                }
+
+                fprintf(stderr, "[krep.c] enter simd_avx2_search 16\n");
+                bool count_incremented_this_match = false;
+
+                if (count_lines_mode)
+                {
+                    fprintf(stderr, "[krep.c] enter simd_avx2_search 17\n");
+                    size_t line_start = find_line_start(text_start, text_len, match_start_offset);
+                    if (line_start != last_counted_line_start)
+                    {
+                        fprintf(stderr, "[krep.c] enter simd_avx2_search 18\n");
+                        current_count++;
+                        last_counted_line_start = line_start;
+                        count_incremented_this_match = true;
+                        // fprintf(stderr, "[krep.c] exit simd_avx2_search 18\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit simd_avx2_search 17\n");
+                }
+                else
+                {
+                    fprintf(stderr, "[krep.c] enter simd_avx2_search 19\n");
+                    current_count++;
+                    count_incremented_this_match = true;
+                    if (track_positions && result)
+                    {
+                        fprintf(stderr, "[krep.c] enter simd_avx2_search 20\n");
+                        if (current_count <= max_count)
+                        {
+                            fprintf(stderr, "[krep.c] enter simd_avx2_search 21\n");
+                            if (!match_result_add(result, match_start_offset, match_start_offset + pattern_len))
+                            {
+                                fprintf(stderr, "[krep.c] enter simd_avx2_search 22\n");
+                                fprintf(stderr, "Warning: Failed to add AVX2 match position.\n");
+                                // fprintf(stderr, "[krep.c] exit simd_avx2_search 22\n");
+                            }
+                            // fprintf(stderr, "[krep.c] exit simd_avx2_search 21\n");
+                        }
+                        // fprintf(stderr, "[krep.c] exit simd_avx2_search 20\n");
+                    }
+                    // fprintf(stderr, "[krep.c] exit simd_avx2_search 19\n");
+                }
+
+                fprintf(stderr, "[krep.c] enter simd_avx2_search 23\n");
+                // Check max_count limit
+                if (count_incremented_this_match && current_count >= max_count)
+                {
+                    fprintf(stderr, "[krep.c] enter simd_avx2_search 24\n");
+                    goto end_avx2_search; // Exit outer loop
+                    // fprintf(stderr, "[krep.c] exit simd_avx2_search 24\n");
+                }
+                // fprintf(stderr, "[krep.c] exit simd_avx2_search 23\n");
+                // fprintf(stderr, "[krep.c] exit simd_avx2_search 16\n");
+                // fprintf(stderr, "[krep.c] exit simd_avx2_search 14\n");
+            }
+
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 25\n");
+            // Clear the found bit to find the next potential start
+            potential_starts_mask &= potential_starts_mask - 1;
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 25\n");
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 13\n");
+        }
+
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 26\n");
+        // Advance position. Advance by 32 for simplicity, might miss overlaps near boundary.
+        // A safer advance would be smaller, e.g., 1 or based on last potential match.
+        // For this basic version, we advance by 32.
+        current_pos += 32;
+        remaining_len -= 32;
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 26\n");
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 9\n");
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 6\n");
+    }
+
+    fprintf(stderr, "[krep.c] enter simd_avx2_search 27\n");
+    // Handle the remaining tail (less than 32 bytes) using scalar search
+    if (remaining_len >= pattern_len)
+    {
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 28\n");
+        // Create a temporary params struct for the tail search
+        search_params_t tail_params = *params;
+        // Adjust max_count for the remaining part
+        if (max_count != SIZE_MAX)
+        {
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 29\n");
+            tail_params.max_count = (current_count >= max_count) ? 0 : max_count - current_count;
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 29\n");
+        }
+
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 30\n");
+        // Use Boyer-Moore for the tail
+        uint64_t tail_count = boyer_moore_search(&tail_params, current_pos, remaining_len, result);
+
+        // Adjust global count and potentially merge results (BM adds directly if result is passed)
+        // Need to adjust offsets if result was passed to BM
+        if (result && track_positions && tail_count > 0)
+        {
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 31\n");
+            // Find where the tail results start in the global result list
+            uint64_t bm_start_index = current_count; // Assuming BM added sequentially
+            if (bm_start_index > result->count)
+            {
+                fprintf(stderr, "[krep.c] enter simd_avx2_search 32\n");
+                bm_start_index = result->count; // Safety check
+                // fprintf(stderr, "[krep.c] exit simd_avx2_search 32\n");
+            }
+            
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 33\n");
+            uint64_t added_by_bm = result->count - bm_start_index;
+
+            size_t tail_offset = current_pos - text_start;
+            for (uint64_t k = 0; k < added_by_bm; ++k)
+            {
+                fprintf(stderr, "[krep.c] enter simd_avx2_search 34\n");
+                result->positions[bm_start_index + k].start_offset += tail_offset;
+                result->positions[bm_start_index + k].end_offset += tail_offset;
+                // fprintf(stderr, "[krep.c] exit simd_avx2_search 34\n");
+            }
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 33\n");
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 31\n");
+        }
+        
+        fprintf(stderr, "[krep.c] enter simd_avx2_search 35\n");
+        current_count += tail_count;
+        // Ensure final count doesn't exceed max_count
+        if (max_count != SIZE_MAX && current_count > max_count)
+        {
+            fprintf(stderr, "[krep.c] enter simd_avx2_search 36\n");
+            current_count = max_count;
+            // Note: Result list might have slightly more entries than max_count here,
+            // but print_matching_items respects max_count.
+            // fprintf(stderr, "[krep.c] exit simd_avx2_search 36\n");
+        }
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 35\n");
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 30\n");
+        // fprintf(stderr, "[krep.c] exit simd_avx2_search 28\n");
+    }
+
+end_avx2_search:
+    fprintf(stderr, "[krep.c] enter simd_avx2_search 37\n");
+    return current_count;
+    // fprintf(stderr, "[krep.c] exit simd_avx2_search 37\n");
+    // fprintf(stderr, "[krep.c] exit simd_avx2_search 27\n");
+}
+#endif
+// Total cost: 5.616592
+// Total split cost: 0.327375, input tokens: 87257, output tokens: 1095, cache read tokens: 43101, cache write tokens: 44147, split chunks: [(0, 392), (392, 1151), (1151, 1829), (1829, 2079), (2079, 2801), (2801, 3571), (3571, 3945)]
+// Total instrumented cost: 5.289217, input tokens: 534651, output tokens: 254263, cache read tokens: 330736, cache write tokens: 203815

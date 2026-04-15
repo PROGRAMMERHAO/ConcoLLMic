@@ -1,0 +1,102 @@
+timestamp: '2025-05-23T15:19:33.782060'
+summary:
+  total_processed_files: 44
+  instrumented_files: 10
+  instrumentation_failed_files: 0
+  non_instrumented_files: 34
+categories:
+  1_instrumented_files:
+    count: 10
+    subcategories:
+      a_newly_instrumented_files:
+        count: 10
+        directories:
+          ./:
+            is_compressed: false
+            4_files:
+            - aho_corasick.c
+            - aho_corasick.h
+            - krep.c
+            - krep.h
+          test:
+            is_compressed: false
+            6_files:
+            - test_compat.h
+            - test_directory.c
+            - test_krep.c
+            - test_krep.h
+            - test_multiple_patterns.c
+            - test_regex.c
+      b_already_instrumented_files:
+        count: 0
+        directories: {}
+  2_instrumentation_failed_files:
+    count: 0
+    directories: {}
+  3_non_instrumented_files:
+    count: 34
+    subcategories:
+      a_excluded_files:
+        count: 29
+        directories:
+          .git/*:
+            is_compressed: true
+            26_files:
+            - HEAD
+            - HEAD
+            - HEAD
+            - HEAD
+            - applypatch-msg.sample
+            - commit-msg.sample
+            - config
+            - description
+            - exclude
+            - fsmonitor-watchman.sample
+            - index
+            - main
+            - main
+            - pack-093b035c0a86b2e053bef204625651face9f80a4.idx
+            - pack-093b035c0a86b2e053bef204625651face9f80a4.pack
+            - packed-refs
+            - post-update.sample
+            - pre-applypatch.sample
+            - pre-commit.sample
+            - pre-merge-commit.sample
+            - pre-push.sample
+            - pre-rebase.sample
+            - pre-receive.sample
+            - prepare-commit-msg.sample
+            - push-to-checkout.sample
+            - update.sample
+          .github:
+            is_compressed: false
+            2_files:
+            - FUNDING.yml
+            - dependabot.yml
+          .github/workflows:
+            is_compressed: false
+            1_files:
+            - ci.yml
+      b_other_skipped_files:
+        count: 5
+        subcategories:
+          unsupported_language:
+            count: 5
+            directories:
+              ./:
+                is_compressed: false
+                5_files:
+                - .gitignore
+                - LICENSE
+                - Makefile
+                - README.md
+                - test_krep
+          special_files:
+            count: 0
+            directories: {}
+          binary_files:
+            count: 0
+            directories: {}
+          read_error_files:
+            count: 0
+            directories: {}
