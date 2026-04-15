@@ -33,6 +33,7 @@ from app.model.register import register_all_models
 
 # Global variables for logging
 LOG_DIR = "logs"
+_directed_target_manager = None  # set after creation so signal/atexit handlers can access it
 
 
 def setup_logging(log_dir: str) -> str:
@@ -63,7 +64,7 @@ def setup_logging(log_dir: str) -> str:
     return log_file_path
 
 
-def print_log_summary(log_file_path: str):
+def print_log_summary(log_file_path: str, directed_target_manager=None):
     """Print summary of warnings and errors from current log file and total retries"""
     warning_count = 0
     error_count = 0
@@ -121,17 +122,41 @@ def print_log_summary(log_file_path: str):
         color = "\033[35m" if retry_count > 0 else "\033[32m"
         _out(f"Total LLM Retry Attempts: {color}{retry_count}\033[0m")
 
+        # Directed target timing breakdown
+        if directed_target_manager and directed_target_manager.targets:
+            _out("-" * (50 + len(TOKEN)))
+            _out("Directed Targets:")
+            total_reached = 0
+            last_reached_time = 0.0
+            for i, t in enumerate(directed_target_manager.targets, 1):
+                loc = f"{t.file_path}:{t.line_start}"
+                if t.line_end != t.line_start:
+                    loc += f"-{t.line_end}"
+                if t.reached:
+                    total_reached += 1
+                    last_reached_time = max(last_reached_time, t.reached_at_time or 0.0)
+                    _out(
+                        f"\t\033[32mTarget {i}: {loc} — REACHED by tc#{t.reached_by_tc_id} at {t.reached_at_time:.1f}s\033[0m"
+                    )
+                else:
+                    _out(f"\t\033[31mTarget {i}: {loc} — NOT REACHED\033[0m")
+            n = len(directed_target_manager.targets)
+            if total_reached == n:
+                _out(f"\tAll {n} target(s) reached. Total time to reach all: \033[32m{last_reached_time:.1f}s\033[0m")
+            else:
+                _out(f"\t{total_reached}/{n} target(s) reached.")
+
     else:
         _out("Log Summary: No log file found")
 
     _out("=" * (50 + len(TOKEN)))
 
 
-def signal_handler(signum, frame, log_file_path: str):
+def signal_handler(signum, frame, log_file_path: str, directed_target_manager=None):
     """Handle termination signals"""
     logger.info("Received termination signal, exiting...")
     print("\n\033[1;34mReceived termination signal, exiting...\033[0m")
-    print_log_summary(log_file_path)
+    print_log_summary(log_file_path, directed_target_manager=directed_target_manager)
     sys.exit(0)
 
 
@@ -165,13 +190,13 @@ def initialize_settings(log_dir: str = LOG_DIR):
     # Register signal/exit handler
     signal.signal(
         signal.SIGINT,
-        lambda signum, frame: signal_handler(signum, frame, log_file_path),
+        lambda signum, frame: signal_handler(signum, frame, log_file_path, _directed_target_manager),
     )
     signal.signal(
         signal.SIGTERM,
-        lambda signum, frame: signal_handler(signum, frame, log_file_path),
+        lambda signum, frame: signal_handler(signum, frame, log_file_path, _directed_target_manager),
     )
-    atexit.register(lambda: print_log_summary(log_file_path))
+    atexit.register(lambda: print_log_summary(log_file_path, _directed_target_manager))
 
 
 def parse_arguments():
@@ -230,6 +255,25 @@ def main():
 
         logger.info(f'Concolic execution command: {" ".join(sys.argv)}')
 
+        # Setup directed target manager if targets specified
+        global _directed_target_manager
+        directed_target_manager = None
+        if args.target:
+            from app.agents.directed import DirectedTargetManager
+
+            directed_target_manager = DirectedTargetManager.parse_target_args(
+                args.target, os.path.normpath(args.project_dir),
+                no_backward_reasoning=args.no_backward_reasoning,
+            )
+            _directed_target_manager = directed_target_manager
+        elif args.monitor_target:
+            from app.agents.directed import DirectedTargetManager
+
+            directed_target_manager = DirectedTargetManager.parse_target_args(
+                args.monitor_target, os.path.normpath(args.project_dir), monitor_only=True
+            )
+            _directed_target_manager = directed_target_manager
+
         # Perform concolic execution phase
         run_concolic_execution(
             project_dir=os.path.normpath(args.project_dir),
@@ -243,6 +287,8 @@ def main():
             resume_in=(os.path.normpath(args.resume_in) if args.resume_in else None),
             plateau_slot=args.plateau_slot,
             parallel_num=args.parallel_num,
+            directed_target_manager=directed_target_manager,
+            stop_on_target=args.stop_on_target,
         )
 
     elif args.command == "instrument_data":

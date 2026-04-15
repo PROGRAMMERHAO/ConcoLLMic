@@ -1,0 +1,284 @@
+id: 6
+src_id: 5
+create_time: '2026-04-14 12:14:42.949'
+time_taken: 144
+states:
+  - SELECT
+  - SUMMARIZE
+  - SOLVE
+  - EXECUTE
+  - FINISHED
+is_target_covered: true
+new_coverage: true
+newly_covered_lines: 2
+is_satisfiable: true
+is_crash: false
+is_hang: false
+usage: |
+  TOTAL:
+    model: claude-sonnet-4-5-20250929
+    cost: $0.06913875
+    call_cnt: 8
+    latency: 49.14s
+    input_tokens: 54938
+    output_tokens: 2441
+    cache_read_tokens: 50285
+    cache_write_tokens: 4639
+  SELECT:
+    TOTAL: {}
+  SUMMARIZE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.05500890
+      call_cnt: 6
+      latency: 40.53s
+      input_tokens: 47883
+      output_tokens: 1882
+      cache_read_tokens: 44283
+      cache_write_tokens: 3592
+    INITIAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00553500
+      call_cnt: 0
+      latency: 0.00s
+      input_tokens: 0
+      output_tokens: 0
+      cache_read_tokens: 0
+      cache_write_tokens: 0
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.02775810
+      call_cnt: 2
+      latency: 26.61s
+      input_tokens: 14440
+      output_tokens: 1242
+      cache_read_tokens: 12910
+      cache_write_tokens: 1527
+    request_code:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.01066365
+      call_cnt: 2
+      latency: 3.83s
+      input_tokens: 16010
+      output_tokens: 146
+      cache_read_tokens: 15155
+      cache_write_tokens: 851
+    select_target_branch:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00730215
+      call_cnt: 1
+      latency: 5.15s
+      input_tokens: 8469
+      output_tokens: 244
+      cache_read_tokens: 7750
+      cache_write_tokens: 718
+    generate_path_constraint:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00375000
+      call_cnt: 1
+      latency: 4.95s
+      input_tokens: 8964
+      output_tokens: 250
+      cache_read_tokens: 8468
+      cache_write_tokens: 496
+  SOLVE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.01412985
+      call_cnt: 2
+      latency: 8.60s
+      input_tokens: 7055
+      output_tokens: 559
+      cache_read_tokens: 6002
+      cache_write_tokens: 1047
+    INITIAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00350550
+      call_cnt: 0
+      latency: 0.00s
+      input_tokens: 0
+      output_tokens: 0
+      cache_read_tokens: 0
+      cache_write_tokens: 0
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00688935
+      call_cnt: 1
+      latency: 5.29s
+      input_tokens: 3364
+      output_tokens: 310
+      cache_read_tokens: 2640
+      cache_write_tokens: 722
+    provide_solution:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00373500
+      call_cnt: 1
+      latency: 3.31s
+      input_tokens: 3691
+      output_tokens: 249
+      cache_read_tokens: 3362
+      cache_write_tokens: 325
+  EXECUTE:
+    TOTAL: {}
+target_branch: if (argc != 3) -> true in main() function of count.c
+target_file_lines: count.c:18-19
+target_lines_content: |2-
+      printf("Usage: %s <float1> <float2>\n", argv[0]);
+      return 1;
+justification: 'This branch has 0% historical coverage (line cov: 0/2 (0%)), making
+  it the only uncovered code in the entire program. All other branches and code blocks
+  have 100% coverage. This branch handles the case where the program is invoked with
+  an incorrect number of command-line arguments, which is an important edge case for
+  input validation. It can be reached by modifying the number of arguments passed
+  to the program (e.g., passing 0, 1, 2, or 4+ arguments instead of exactly 2).'
+target_path_constraint: |-
+  To reach the branch `if (argc != 3) -> true` in the main() function:
+
+  1. **Command-Line Arguments Count**: The program must be invoked with a number of arguments different from 3 (where argc counts the program name plus all arguments).
+     - Constraint: `argc != 3`
+     
+     This can be satisfied by:
+     - Passing 0 arguments: `./count` (argc = 1)
+     - Passing 1 argument: `./count arg1` (argc = 2)
+     - Passing 3 or more arguments: `./count arg1 arg2 arg3` (argc = 4), etc.
+
+  Note: argc includes the program name itself, so argc=3 means the program name plus 2 arguments. To trigger this branch, provide any number of arguments other than exactly 2.
+selected_cnt: 3
+successful_generation_cnt: 3
+exec_code: |-
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+returncode: 1
+src_execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      // Unexecuted code (lines 18-19) removed. Its line cov: 0/2 (0%)
+    }
+    
+    start = atof(argv[1]);
+    end = atof(argv[2]);
+
+    // We constrain the bounds to be numbers, ordered, and within the
+    // range [START_FLOAT, END_FLOAT].  As a result, FLOATS_BETWEEN
+    // gives a bound on the number of single-precision floating-point
+    // numbers that lie in between these bounds.
+
+    if(isnan(start) || isnan(end)) {
+      // Unexecuted code (line 31) removed. Its line cov: 1/1 (100%)
+    }
+
+    if(start > end) {
+      // Unexecuted code (line 35) removed. Its line cov: 1/1 (100%)
+    }
+   
+    if(start < START_FLOAT) {
+      // Unexecuted code (line 39) removed. Its line cov: 1/1 (100%)
+    }
+
+    if(end > END_FLOAT) {
+      return 0;
+    }
+
+    // Unexecuted code (lines 46-71) removed. Its line cov: 22/22 (100%)
+  }
+  ```
+
+crash_info:
+execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 2
+execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      printf("Usage: %s <float1> <float2>\n", argv[0]);
+      return 1;
+    }
+    
+    // Unexecuted code (lines 22-71) removed. Its line cov: 40/40 (100%)
+  }
+  ```
+
+src_exec_code: |-
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count", "1.0", "1.00002"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+src_execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 3
+  [count.c] enter main 5
+  [count.c] enter main 7
+  [count.c] enter main 9
+  [count.c] enter main 10
+target_distance: 0
+directed_target_reached: false

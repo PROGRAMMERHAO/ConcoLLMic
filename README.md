@@ -28,6 +28,7 @@ This eliminates the need for hand-crafted language-specific symbolic interpreter
 ## Table of Contents
 - [Workflow Example](#workflow-example)
 - [Getting Started](#getting-started)
+- [Directed Testing](#directed-testing)
 - [Command Reference](#command-reference)
 - [Running Large-Scale Experiments](#running-large-scale-experiments)
 - [License](#license)
@@ -271,6 +272,76 @@ python3 ACE.py replay \
 The `gcov` report will show that the bug at line 67 has been triggered.
 
 </details>
+
+---
+
+## Directed Testing
+
+ConcoLLMic supports **directed concolic testing** — guiding exploration toward a specific target location in the code. This is useful when you want to reach a particular function or code path quickly (e.g., a known vulnerability, a rarely-triggered branch, or a security-sensitive function).
+
+### How It Works
+
+When a `--target` is specified, ConcoLLMic:
+
+1. **Runs backward reasoning** — an LLM agent analyzes the code and produces a reachability plan: a chain of conditions from program entry to the target.
+2. **Computes distance** — each generated test case is assigned a distance score to the target (0 = reached, 1 = same function entered, 2 = same file entered, 3 = caller entered, 4 = no connection).
+3. **Adapts strategy** — uses a hybrid directed/undirected approach: if distance does not improve for 3 consecutive rounds, it switches to undirected exploration for 2 rounds to escape local optima, then refocuses on the target.
+4. **Stops early (optional)** — with `--stop-on-target`, execution halts as soon as the target is reached.
+
+### Usage
+
+**Directed mode** — actively guides exploration toward the target:
+
+```bash
+python3 ACE.py run \
+    --project_dir ./code_example/instr/ \
+    --execution ./code_example/harness/count.py \
+    --out ./out_directed/ \
+    --target count.c:66 \
+    --stop-on-target
+```
+
+**Multiple targets** — specify `--target` more than once:
+
+```bash
+python3 ACE.py run \
+    --project_dir ./code_example/instr/ \
+    --execution ./code_example/harness/count.py \
+    --out ./out_directed/ \
+    --target count.c:66 \
+    --target count.c:80
+```
+
+**Monitor-only mode** — tracks when a target is reached without directing exploration (useful for comparing against a baseline undirected run):
+
+```bash
+python3 ACE.py run \
+    --project_dir ./code_example/instr/ \
+    --execution ./code_example/harness/count.py \
+    --out ./out_undirected/ \
+    --monitor-target count.c:66
+```
+
+### Target Format
+
+Targets are specified as `file:line` or `file:line_start-line_end`, where `file` is relative to `--project_dir`:
+
+```
+count.c:66          # single line
+krep.c:1556-1570    # line range
+```
+
+### Output
+
+The LOG SUMMARY at the end of a run includes directed target results:
+
+```
+Directed Targets:
+    Target 1: count.c:66 — REACHED by tc#4 at 12.3s
+All 1 target(s) reached. Total time to reach all: 12.3s
+```
+
+The current directed target state (distances, strategy, reach status) is also saved to `directed_targets.yaml` in the output directory after each round.
 
 ---
 

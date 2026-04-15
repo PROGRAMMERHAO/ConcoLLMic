@@ -27,6 +27,7 @@ from app.agents.common import (
     HistoricalInformation,
     PathConstraint,
     SrcTestCaseId,
+    TargetDistance,
     TestCaseId,
     TestCaseInformation,
     wrap_between_tags,
@@ -283,6 +284,10 @@ class TestCase:
 
     src_exec_code: str | None = None
     src_execution_trace: str | None = None
+
+    # Directed testing fields
+    target_distance: int | None = None  # min distance to any directed target (0-4)
+    directed_target_reached: bool = False  # whether this TC reached a directed target
 
     # Output directory (non-serialized)
     _out_dir: str | None = field(default=None, repr=False)
@@ -623,7 +628,7 @@ class TestCase:
 
     def is_valuable(self) -> bool:
         """Check if the test case is valuable for further exploration."""
-        return self.is_target_covered or self.new_coverage
+        return self.is_target_covered or self.new_coverage or self.directed_target_reached
 
 
 class TestCaseManager:
@@ -852,7 +857,7 @@ class TestCaseManager:
         """Get the maximum time taken to generate all test cases."""
         return max(tc.time_taken for tc in self.test_cases.values())
 
-    def get_all_scheduling_information(self) -> dict[int, str]:
+    def get_all_scheduling_information(self, directed_target_manager=None) -> dict[int, str]:
         """
         Get information about all test cases for the scheduling agent.
         Returns a formatted string with all test cases information needed for scheduling.
@@ -874,7 +879,9 @@ class TestCaseManager:
                         tc_id,
                     )
                 assert tc.exec_code is not None
-                info, weight = self.get_test_case_scheduling_information(tc_id)
+                info, weight = self.get_test_case_scheduling_information(
+                    tc_id, directed_target_manager=directed_target_manager
+                )
                 info = wrap_between_tags(
                     TestCaseInformation.__xml_tag__,
                     info,
@@ -917,7 +924,9 @@ class TestCaseManager:
         else:
             return {tc_id: info for info, _, tc_id in valuable_testcase_info}
 
-    def get_test_case_scheduling_information(self, tc_id: int) -> tuple[str, float]:
+    def get_test_case_scheduling_information(
+        self, tc_id: int, directed_target_manager=None
+    ) -> tuple[str, float]:
         """
         Get detailed information about a specific test case for the scheduling agent.
 
@@ -1042,5 +1051,23 @@ class TestCaseManager:
             HistoricalInformation.__xml_tag__,
             f"{historical_fail_info[0]}/{historical_fail_info[1]}({fail_ratio:.1%})",
         )
+
+        # 7. Target Distance (directed mode only)
+        if directed_target_manager is not None and tc.execution_trace:
+            distance = directed_target_manager.compute_min_distance(tc.execution_trace)
+            distance_labels = {
+                0: "TARGET REACHED",
+                1: "SAME FUNCTION as target",
+                2: "SAME FILE as target",
+                3: "CALLER of target function",
+                4: "NO CONNECTION to target",
+            }
+            distance_label = distance_labels.get(distance, f"distance={distance}")
+            info += wrap_between_tags(
+                TargetDistance.__xml_tag__,
+                f"{distance} ({distance_label})",
+            )
+            # Boost weight for closer test cases
+            weight = (5 - distance) * 2 + (1 - fail_ratio)
 
         return info, weight + 1 if tc.new_coverage else 0

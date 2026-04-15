@@ -95,11 +95,13 @@ CONSTRAINT_SOLVING_TEMPERATURE = 0.0
 def solve(
     execution_information: str,
     target_path_constraint: str,
+    directed_hint: str | None = None,
 ) -> tuple[bool, str | None, dict[str, tuple[int, Usage]], MessageThread]:
     """
     Args:
         - execution_information: information about the execution
         - target_path_constraint: constraints over the input and environment
+        - directed_hint: optional hint about the directed target location
     Returns:
         - is_satisfiable: whether constraints are satisfiable
         - python_execution: Python code to execute the program with solved inputs
@@ -125,6 +127,10 @@ def solve(
     )
 
     msg_thread.add_user(user_prompt_execution_info)
+
+    if directed_hint:
+        msg_thread.add_user(directed_hint)
+
     msg_thread.add_user(
         user_prompt_target_path_constraint, clear_pre_cache_role=[]
     )  # optimize for parallel solving

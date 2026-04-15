@@ -1,4 +1,7 @@
+import os
 import tempfile
+
+import yaml
 
 from app.agents.states import TestcaseState
 from app.agents.testcase import TestCaseManager, TestCaseYAML
@@ -73,6 +76,38 @@ def collect_run_data(out_dir: str, print_tokens: bool):
 
         _, show_str = testcase_manager.get_statistics()
         print(show_str)
+
+        # Directed testing metrics
+        directed_path = os.path.join(out_dir, "directed_targets.yaml")
+        if os.path.exists(directed_path):
+            print("\n" + "=" * 50)
+            print("DIRECTED TESTING METRICS")
+            print("=" * 50)
+            with open(directed_path) as f:
+                directed_data = yaml.safe_load(f)
+
+            if directed_data and "targets" in directed_data:
+                for i, target in enumerate(directed_data["targets"]):
+                    status = "REACHED" if target["reached"] else "NOT REACHED"
+                    print(
+                        f"\nTarget {i + 1}: {target['file_path']}:"
+                        f"{target['line_start']}-{target['line_end']} [{status}]"
+                    )
+                    if target["reached"]:
+                        print(f"  Reached by test case: #{target['reached_by_tc_id']}")
+                        print(f"  Time to reach: {target['reached_at_time']:.1f}s")
+
+            if directed_data and "progress" in directed_data:
+                progress = directed_data["progress"]
+                print(f"\nFinal strategy: {progress.get('current_strategy', 'N/A')}")
+                print(f"Best distance achieved: {progress.get('best_distance', 'N/A')}")
+                if progress.get("distance_history"):
+                    print("Distance progression:")
+                    for round_num, dist in progress["distance_history"]:
+                        labels = {0: "REACHED", 1: "same func", 2: "same file", 3: "caller", 4: "none"}
+                        print(f"  Round {round_num}: distance={dist} ({labels.get(dist, '?')})")
+
+            print("=" * 50)
 
 
 def setup_run_data_parser(subparsers):

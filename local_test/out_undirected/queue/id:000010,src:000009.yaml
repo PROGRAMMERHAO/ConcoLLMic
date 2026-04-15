@@ -1,0 +1,293 @@
+id: 10
+src_id: 9
+create_time: '2026-04-14 12:17:36.793'
+time_taken: 320
+states:
+  - SELECT
+  - SUMMARIZE
+  - SOLVE
+  - EXECUTE
+  - FINISHED
+is_target_covered: true
+new_coverage: false
+newly_covered_lines: 0
+is_satisfiable: true
+is_crash: false
+is_hang: false
+usage: |
+  TOTAL:
+    model: claude-sonnet-4-5-20250929
+    cost: $0.06582465
+    call_cnt: 7
+    latency: 52.26s
+    input_tokens: 45595
+    output_tokens: 2498
+    cache_read_tokens: 41338
+    cache_write_tokens: 4243
+  SELECT:
+    TOTAL: {}
+  SUMMARIZE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.04939440
+      call_cnt: 5
+      latency: 41.59s
+      input_tokens: 38304
+      output_tokens: 1829
+      cache_read_tokens: 35268
+      cache_write_tokens: 3028
+    INITIAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00503250
+      call_cnt: 0
+      latency: 0.00s
+      input_tokens: 0
+      output_tokens: 0
+      cache_read_tokens: 0
+      cache_write_tokens: 0
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.02739705
+      call_cnt: 2
+      latency: 27.79s
+      input_tokens: 14174
+      output_tokens: 1227
+      cache_read_tokens: 12664
+      cache_write_tokens: 1507
+    request_code:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00553695
+      call_cnt: 1
+      latency: 2.00s
+      input_tokens: 7002
+      output_tokens: 74
+      cache_read_tokens: 6553
+      cache_write_tokens: 446
+    select_target_branch:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00661290
+      call_cnt: 1
+      latency: 5.27s
+      input_tokens: 8434
+      output_tokens: 207
+      cache_read_tokens: 7618
+      cache_write_tokens: 815
+    generate_path_constraint:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00481500
+      call_cnt: 1
+      latency: 6.54s
+      input_tokens: 8694
+      output_tokens: 321
+      cache_read_tokens: 8433
+      cache_write_tokens: 260
+  SOLVE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.01643025
+      call_cnt: 2
+      latency: 10.67s
+      input_tokens: 7291
+      output_tokens: 669
+      cache_read_tokens: 6070
+      cache_write_tokens: 1215
+    INITIAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00376050
+      call_cnt: 0
+      latency: 0.00s
+      input_tokens: 0
+      output_tokens: 0
+      cache_read_tokens: 0
+      cache_write_tokens: 0
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00878475
+      call_cnt: 1
+      latency: 7.39s
+      input_tokens: 3432
+      output_tokens: 410
+      cache_read_tokens: 2640
+      cache_write_tokens: 790
+    provide_solution:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00388500
+      call_cnt: 1
+      latency: 3.28s
+      input_tokens: 3859
+      output_tokens: 259
+      cache_read_tokens: 3430
+      cache_write_tokens: 425
+  EXECUTE:
+    TOTAL: {}
+target_branch: if(isnan(start) || isnan(end)) -> false in count.c:main
+target_file_lines: count.c:34-35
+target_lines_content: |2-
+    if(start > end) {
+      return 0;
+justification: This branch leads to the main program logic (lines 34-71). While the
+  code in this section has 100% line coverage, selecting this branch allows exploration
+  of the core functionality with different input combinations. The current execution
+  returns early due to NaN input, so exploring the false branch will exercise the
+  floating-point counting logic, boundary checks, and the bug-triggering condition.
+target_path_constraint: |-
+  To reach the branch where `if(isnan(start) || isnan(end))` evaluates to false:
+
+  1. Command-Line Arguments: The program must receive exactly 3 arguments (program name + 2 arguments):
+     - argc == 3
+
+  2. First Argument (start value): argv[1] must be a string that, when parsed by atof(), produces a valid floating-point number (not NaN):
+     - atof(argv[1]) must return a valid float value
+     - NOT isnan(atof(argv[1]))
+     
+  3. Second Argument (end value): argv[2] must be a string that, when parsed by atof(), produces a valid floating-point number (not NaN):
+     - atof(argv[2]) must return a valid float value
+     - NOT isnan(atof(argv[2]))
+
+  In summary, both argv[1] and argv[2] must be parseable as valid floating-point numbers. Examples of valid inputs include numeric strings like "1.0", "2.5", "0.0", etc. The string "nan" or "NaN" would produce NaN values and should be avoided.
+selected_cnt: 1
+successful_generation_cnt: 1
+exec_code: |-
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count", "0.0", "1.0"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+returncode: 0
+src_execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      // Unexecuted code (lines 18-19) removed. Its line cov: 2/2 (100%)
+    }
+    
+    start = atof(argv[1]);
+    end = atof(argv[2]);
+
+    // We constrain the bounds to be numbers, ordered, and within the
+    // range [START_FLOAT, END_FLOAT].  As a result, FLOATS_BETWEEN
+    // gives a bound on the number of single-precision floating-point
+    // numbers that lie in between these bounds.
+
+    if(isnan(start) || isnan(end)) {
+      return 0;
+    }
+
+    // Unexecuted code (lines 34-71) removed. Its line cov: 31/31 (100%)
+  }
+  ```
+
+crash_info:
+execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 3
+  [count.c] enter main 5
+  [count.c] enter main 7
+  [count.c] enter main 8
+execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      // Unexecuted code (lines 18-19) removed. Its line cov: 2/2 (100%)
+    }
+    
+    start = atof(argv[1]);
+    end = atof(argv[2]);
+
+    // We constrain the bounds to be numbers, ordered, and within the
+    // range [START_FLOAT, END_FLOAT].  As a result, FLOATS_BETWEEN
+    // gives a bound on the number of single-precision floating-point
+    // numbers that lie in between these bounds.
+
+    if(isnan(start) || isnan(end)) {
+      // Unexecuted code (line 31) removed. Its line cov: 1/1 (100%)
+    }
+
+    if(start > end) {
+      // Unexecuted code (line 35) removed. Its line cov: 1/1 (100%)
+    }
+   
+    if(start < START_FLOAT) {
+      return 0;
+    }
+
+    // Unexecuted code (lines 42-71) removed. Its line cov: 25/25 (100%)
+  }
+  ```
+
+src_exec_code: |-
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count", "nan", "1.0"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+src_execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 3
+  [count.c] enter main 4
+target_distance: 0
+directed_target_reached: false

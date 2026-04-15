@@ -1,0 +1,496 @@
+id: 1
+src_id: 0
+create_time: '2026-04-14 12:29:56.121'
+time_taken: 80
+states:
+  - SELECT
+  - SUMMARIZE
+  - SOLVE
+  - EXECUTE
+  - FINISHED
+is_target_covered: true
+new_coverage: true
+newly_covered_lines: 2
+is_satisfiable: true
+is_crash: false
+is_hang: false
+usage: |
+  TOTAL:
+    model: claude-sonnet-4-5-20250929
+    cost: $0.10667865
+    call_cnt: 9
+    latency: 78.07s
+    input_tokens: 59553
+    output_tokens: 4366
+    cache_read_tokens: 52788
+    cache_write_tokens: 6743
+  SELECT:
+    TOTAL: {}
+  SUMMARIZE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.05343225
+      call_cnt: 5
+      latency: 39.37s
+      input_tokens: 40227
+      output_tokens: 2002
+      cache_read_tokens: 36940
+      cache_write_tokens: 3279
+    INITIAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00644250
+      call_cnt: 0
+      latency: 0.00s
+      input_tokens: 0
+      output_tokens: 0
+      cache_read_tokens: 0
+      cache_write_tokens: 0
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.02470905
+      call_cnt: 2
+      latency: 19.62s
+      input_tokens: 15089
+      output_tokens: 1069
+      cache_read_tokens: 13221
+      cache_write_tokens: 1865
+    request_code:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00688155
+      call_cnt: 1
+      latency: 2.93s
+      input_tokens: 7559
+      output_tokens: 157
+      cache_read_tokens: 6929
+      cache_write_tokens: 627
+    select_target_branch:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00755415
+      call_cnt: 1
+      latency: 5.83s
+      input_tokens: 8634
+      output_tokens: 253
+      cache_read_tokens: 8157
+      cache_write_tokens: 476
+    generate_path_constraint:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00784500
+      call_cnt: 1
+      latency: 10.99s
+      input_tokens: 8945
+      output_tokens: 523
+      cache_read_tokens: 8633
+      cache_write_tokens: 311
+  SOLVE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.05324640
+      call_cnt: 4
+      latency: 38.70s
+      input_tokens: 19326
+      output_tokens: 2364
+      cache_read_tokens: 15848
+      cache_write_tokens: 3464
+    INITIAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00454425
+      call_cnt: 0
+      latency: 0.00s
+      input_tokens: 0
+      output_tokens: 0
+      cache_read_tokens: 0
+      cache_write_tokens: 0
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.01227870
+      call_cnt: 1
+      latency: 11.83s
+      input_tokens: 3641
+      output_tokens: 593
+      cache_read_tokens: 2640
+      cache_write_tokens: 999
+    execute_python:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.03171345
+      call_cnt: 2
+      latency: 20.19s
+      input_tokens: 9577
+      output_tokens: 1457
+      cache_read_tokens: 7886
+      cache_write_tokens: 1683
+    provide_solution:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00471000
+      call_cnt: 1
+      latency: 6.68s
+      input_tokens: 6108
+      output_tokens: 314
+      cache_read_tokens: 5322
+      cache_write_tokens: 782
+  EXECUTE:
+    TOTAL: {}
+target_branch: if (count <= FLOATS_BETWEEN_BUG) -> true at line 66 in count.c
+target_file_lines: count.c:67-68
+target_lines_content: |2-
+      printf("BUG triggered!");
+      return 1;
+justification: This branch has 0% coverage (0/2 lines) and is the most important branch
+  to explore. It's specifically designed to detect a bug condition, as indicated by
+  the variable name FLOATS_BETWEEN_BUG (value 20) and the message "BUG triggered!".
+  This branch tests the core functionality of the program - counting floating-point
+  numbers in a range. Triggering this branch would reveal edge cases in floating-point
+  arithmetic and potentially expose the bug the program is designed to detect. This
+  has higher priority than simple input validation branches.
+target_path_constraint: |-
+  To reach the branch where count <= FLOATS_BETWEEN_BUG (where FLOATS_BETWEEN_BUG = 20):
+
+  1. **Command-Line Arguments**: The program must receive exactly 3 arguments (program name + 2 float arguments):
+     - argc == 3
+
+  2. **Argument Parsing**: argv[1] and argv[2] must be parseable as floating-point numbers by atof():
+     - atof(argv[1]) produces a valid float (not NaN)
+     - atof(argv[2]) produces a valid float (not NaN)
+
+  3. **NaN Validation**: Neither start nor end should be NaN:
+     - !isnan(start) AND !isnan(end)
+     - Where start = atof(argv[1]) and end = atof(argv[2])
+
+  4. **Ordering Constraint**: start must be less than or equal to end:
+     - start <= end
+
+  5. **Range Constraints**: The values must be within the valid range:
+     - start >= START_FLOAT (where START_FLOAT = 1.0)
+     - end <= END_FLOAT (where END_FLOAT = 1.00001)
+
+  6. **Count Constraint**: The number of single-precision floating-point numbers between start (inclusive) and end (exclusive) must be at most 20:
+     - count <= 20
+     - Where count is computed by iterating through floats from start to end, incrementing the bit representation as unsigned integer
+     - This means the range [start, end) should contain at most 20 distinct float values
+     - Given the constraints: 1.0 <= start < end <= 1.00001, we need a narrow range
+     - The count is determined by the difference in the unsigned integer representations of the float values
+
+  To satisfy count <= 20, the inputs should specify a very narrow range of floating-point numbers. For example, start and end should be very close together such that there are at most 20 representable single-precision floats between them.
+selected_cnt: 0
+successful_generation_cnt: 0
+exec_code: |-
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count", "1.0", "1.000002384185791"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              shell=False,
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+returncode: 1
+src_execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      // Unexecuted code (lines 18-19) removed. Its line cov: 0/2 (0%)
+    }
+    
+    start = atof(argv[1]);
+    end = atof(argv[2]);
+
+    // We constrain the bounds to be numbers, ordered, and within the
+    // range [START_FLOAT, END_FLOAT].  As a result, FLOATS_BETWEEN
+    // gives a bound on the number of single-precision floating-point
+    // numbers that lie in between these bounds.
+
+    if(isnan(start) || isnan(end)) {
+      // Unexecuted code (line 31) removed. Its line cov: 0/1 (0%)
+    }
+
+    if(start > end) {
+      // Unexecuted code (line 35) removed. Its line cov: 0/1 (0%)
+    }
+   
+    if(start < START_FLOAT) {
+      // Unexecuted code (line 39) removed. Its line cov: 0/1 (0%)
+    }
+
+    if(end > END_FLOAT) {
+      // Unexecuted code (line 43) removed. Its line cov: 0/1 (0%)
+    }
+
+    int count = 0;
+    
+    // We require that unsigned and float have the same size for the
+    // program to operate correctly
+    assert(sizeof(unsigned) == sizeof(float));
+
+    // Iterate through the floating-point numbers in the range by
+    // bit-conversion to unsigned.
+    for(float current = start; current != end; count++) {
+      unsigned temp;
+      memcpy(&temp, &current, sizeof(float));
+      temp++;
+      memcpy(&current, &temp, sizeof(float));
+    }
+
+    // Check that the count is non-negative and bounded above by
+    // FLOATS_BETWEEN
+    printf("Count is %d\n", count);
+    assert(count >= 0);
+    assert(FLOATS_BETWEEN_MAX);
+    if (count <= FLOATS_BETWEEN_BUG) {
+      // Unexecuted code (lines 67-68) removed. Its line cov: 0/2 (0%)
+    }
+    
+    return 0;
+  }
+  ```
+
+crash_info:
+execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 3
+  [count.c] enter main 5
+  [count.c] enter main 7
+  [count.c] enter main 9
+  [count.c] enter main 11
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 13
+  [count.c] enter main 14
+execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      // Unexecuted code (lines 18-19) removed. Its line cov: 2/2 (100%)
+    }
+    
+    start = atof(argv[1]);
+    end = atof(argv[2]);
+
+    // We constrain the bounds to be numbers, ordered, and within the
+    // range [START_FLOAT, END_FLOAT].  As a result, FLOATS_BETWEEN
+    // gives a bound on the number of single-precision floating-point
+    // numbers that lie in between these bounds.
+
+    if(isnan(start) || isnan(end)) {
+      // Unexecuted code (line 31) removed. Its line cov: 1/1 (100%)
+    }
+
+    if(start > end) {
+      // Unexecuted code (line 35) removed. Its line cov: 0/1 (0%)
+    }
+   
+    if(start < START_FLOAT) {
+      // Unexecuted code (line 39) removed. Its line cov: 0/1 (0%)
+    }
+
+    if(end > END_FLOAT) {
+      // Unexecuted code (line 43) removed. Its line cov: 0/1 (0%)
+    }
+
+    int count = 0;
+    
+    // We require that unsigned and float have the same size for the
+    // program to operate correctly
+    assert(sizeof(unsigned) == sizeof(float));
+
+    // Iterate through the floating-point numbers in the range by
+    // bit-conversion to unsigned.
+    for(float current = start; current != end; count++) {
+      unsigned temp;
+      memcpy(&temp, &current, sizeof(float));
+      temp++;
+      memcpy(&current, &temp, sizeof(float));
+    }
+
+    // Check that the count is non-negative and bounded above by
+    // FLOATS_BETWEEN
+    printf("Count is %d\n", count);
+    assert(count >= 0);
+    assert(FLOATS_BETWEEN_MAX);
+    if (count <= FLOATS_BETWEEN_BUG) {
+      printf("BUG triggered!");
+      return 1;
+    }
+    
+    return 0;
+  }
+  ```
+
+src_exec_code: |
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count 1.0 1.00001"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              shell=True,
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+src_execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 3
+  [count.c] enter main 5
+  [count.c] enter main 7
+  [count.c] enter main 9
+  [count.c] enter main 11
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 12
+  [count.c] enter main 13
+target_distance: 0
+directed_target_reached: false

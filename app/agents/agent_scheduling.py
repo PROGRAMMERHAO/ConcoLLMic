@@ -15,6 +15,7 @@ from app.agents.common import (
     Instructions,
     PathConstraint,
     SrcTestCaseId,
+    TargetDistance,
     TestCaseId,
     parse_tool_arguments,
 )
@@ -67,18 +68,43 @@ Traditional concolic execution typically selects the most recently generated tes
 Evaluate each test case against the above criteria before making your final selection. Remember that the goal is to maximize code coverage and explore diverse program behaviors by systematically generating test cases that follow different execution paths.
 """
 
+DIRECTED_SCHEDULING_PROMPT_SUFFIX = """
+
+**DIRECTED TESTING MODE**: Your PRIMARY goal is to select test cases that bring execution closer to the following target location(s):
+{target_descriptions}
+
+Each test case now includes a `<{target_distance_tag}>` tag showing its distance to the target:
+- Distance 0: Target already reached (should not appear -- already filtered)
+- Distance 1: Execution entered the same function as the target -- HIGHEST priority
+- Distance 2: Execution entered the same file as the target -- HIGH priority
+- Distance 3: Execution entered a function known to call the target function -- MEDIUM priority
+- Distance 4: No observed connection to the target -- LOW priority
+
+Updated selection priority:
+1. **Target Proximity**: STRONGLY prefer test cases with lower distance to target
+2. **Coverage Potential Near Target** (secondary): Among equal-distance test cases, prefer those with more uncovered code in the target's file/function
+3. **Historical Information**: Avoid test cases with very high failure ratios
+"""
+
 SCHEDULING_TEMPERATURE = 0.0
 
 
 class TestCaseScheduler:
     """Test case scheduler for concolic execution"""
 
-    def __init__(self):
+    def __init__(self, directed_target_descriptions: str | None = None):
         self.already_cached_tc_ids: set[int] = set()
+        self.directed_target_descriptions = directed_target_descriptions
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the scheduler"""
-        return unescape(Instructions(instructions=SYSTEM_PROMPT).to_xml().decode())
+        prompt = SYSTEM_PROMPT
+        if self.directed_target_descriptions:
+            prompt += DIRECTED_SCHEDULING_PROMPT_SUFFIX.format(
+                target_descriptions=self.directed_target_descriptions,
+                target_distance_tag=TargetDistance.__xml_tag__,
+            )
+        return unescape(Instructions(instructions=prompt).to_xml().decode())
 
     def _build_user_prompt(self, provided_tc_info: dict[int, str]) -> str:
         """Build the user prompt for the scheduler"""

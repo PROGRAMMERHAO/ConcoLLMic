@@ -1,0 +1,261 @@
+id: 9
+src_id: 6
+create_time: '2026-04-14 12:16:35.419'
+time_taken: 265
+states:
+  - SELECT
+  - SUMMARIZE
+  - SOLVE
+  - EXECUTE
+  - FINISHED
+is_target_covered: true
+new_coverage: false
+newly_covered_lines: 0
+is_satisfiable: true
+is_crash: false
+is_hang: false
+usage: |
+  TOTAL:
+    model: claude-sonnet-4-5-20250929
+    cost: $0.05046900
+    call_cnt: 6
+    latency: 41.25s
+    input_tokens: 44429
+    output_tokens: 1919
+    cache_read_tokens: 42005
+    cache_write_tokens: 2414
+  SUMMARIZE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.03027705
+      call_cnt: 3
+      latency: 23.85s
+      input_tokens: 32814
+      output_tokens: 1051
+      cache_read_tokens: 31461
+      cache_write_tokens: 1353
+    generate_path_constraint:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.01144080
+      call_cnt: 1
+      latency: 8.57s
+      input_tokens: 11264
+      output_tokens: 406
+      cache_read_tokens: 11005
+      cache_write_tokens: 259
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.01153350
+      call_cnt: 1
+      latency: 10.44s
+      input_tokens: 10545
+      output_tokens: 443
+      cache_read_tokens: 9911
+      cache_write_tokens: 634
+    select_target_branch:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00730275
+      call_cnt: 1
+      latency: 4.85s
+      input_tokens: 11005
+      output_tokens: 202
+      cache_read_tokens: 10545
+      cache_write_tokens: 460
+  SOLVE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.02019195
+      call_cnt: 3
+      latency: 17.40s
+      input_tokens: 11615
+      output_tokens: 868
+      cache_read_tokens: 10544
+      cache_write_tokens: 1061
+    INITIAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00231390
+      call_cnt: 0
+      latency: 0.00s
+      input_tokens: 0
+      output_tokens: 0
+      cache_read_tokens: 0
+      cache_write_tokens: 0
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00809535
+      call_cnt: 1
+      latency: 7.77s
+      input_tokens: 3509
+      output_tokens: 372
+      cache_read_tokens: 3143
+      cache_write_tokens: 364
+    execute_python:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00529770
+      call_cnt: 1
+      latency: 3.48s
+      input_tokens: 3898
+      output_tokens: 197
+      cache_read_tokens: 3507
+      cache_write_tokens: 387
+    provide_solution:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00448500
+      call_cnt: 1
+      latency: 6.15s
+      input_tokens: 4208
+      output_tokens: 299
+      cache_read_tokens: 3894
+      cache_write_tokens: 310
+  EXECUTE:
+    TOTAL: {}
+target_branch: if(isnan(start) || isnan(end)) -> true in count.c:main at line 30
+target_file_lines: count.c:31-31
+target_lines_content: '    return 0;'
+justification: This branch handles the edge case where one or both input arguments
+  are NaN (Not a Number). While it has 100% historical coverage, it represents an
+  important input validation path that tests the program's robustness against invalid
+  floating-point inputs. This demonstrates a different type of constraint (invalid
+  float values) compared to the previous selections.
+target_path_constraint: |-
+  To reach the branch where `if(isnan(start) || isnan(end))` evaluates to true at line 30 in count.c:main, the following constraints must be satisfied:
+
+  1. **Command-Line Arguments Count**: `argc == 3` (program invoked with exactly 2 arguments)
+
+  2. **NaN Generation**: At least one of the two command-line arguments must result in a NaN value when parsed by `atof()`:
+     - Either `isnan(atof(argv[1]))` is true, OR
+     - `isnan(atof(argv[2]))` is true, OR
+     - Both are true
+
+  3. **How to produce NaN with atof()**:
+     - The `atof()` function in C converts a string to a double/float
+     - `atof()` returns 0.0 for invalid inputs and does NOT return NaN for most invalid strings
+     - However, if the input string represents special floating-point values, it may produce NaN
+     - Common ways to get NaN: the string "NaN", "nan", "-NaN", "+NaN" (case-insensitive on some systems)
+     - Note: The exact behavior is implementation-dependent, but most modern C libraries support parsing "nan" or "NaN" as NaN
+
+  In summary: provide at least one command-line argument that, when parsed by `atof()`, produces a NaN value. This typically means using strings like "nan", "NaN", "-nan", or similar special floating-point representations.
+selected_cnt: 1
+successful_generation_cnt: 1
+exec_code: |-
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count", "nan", "1.0"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+returncode: 0
+src_execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      printf("Usage: %s <float1> <float2>\n", argv[0]);
+      return 1;
+    }
+    
+    // Unexecuted code (lines 22-71) removed. Its line cov: 40/40 (100%)
+  }
+  ```
+
+crash_info:
+execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 3
+  [count.c] enter main 4
+execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      // Unexecuted code (lines 18-19) removed. Its line cov: 2/2 (100%)
+    }
+    
+    start = atof(argv[1]);
+    end = atof(argv[2]);
+
+    // We constrain the bounds to be numbers, ordered, and within the
+    // range [START_FLOAT, END_FLOAT].  As a result, FLOATS_BETWEEN
+    // gives a bound on the number of single-precision floating-point
+    // numbers that lie in between these bounds.
+
+    if(isnan(start) || isnan(end)) {
+      return 0;
+    }
+
+    // Unexecuted code (lines 34-71) removed. Its line cov: 31/31 (100%)
+  }
+  ```
+
+src_exec_code: |-
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+src_execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 2
+target_distance: 0
+directed_target_reached: false

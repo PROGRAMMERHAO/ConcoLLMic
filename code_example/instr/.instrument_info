@@ -1,0 +1,49 @@
+timestamp: '2026-04-14T10:37:10.908813'
+summary:
+  total_processed_files: 3
+  instrumented_files: 2
+  instrumentation_failed_files: 0
+  non_instrumented_files: 1
+categories:
+  1_instrumented_files:
+    count: 2
+    subcategories:
+      a_newly_instrumented_files:
+        count: 0
+        directories: {}
+      b_already_instrumented_files:
+        count: 2
+        directories:
+          ./:
+            is_compressed: false
+            2_files:
+            - count.c
+            - validate_brackets.cpp
+  2_instrumentation_failed_files:
+    count: 0
+    directories: {}
+  3_non_instrumented_files:
+    count: 1
+    subcategories:
+      a_excluded_files:
+        count: 0
+        directories: {}
+      b_other_skipped_files:
+        count: 1
+        subcategories:
+          unsupported_language:
+            count: 1
+            directories:
+              ./:
+                is_compressed: false
+                1_files:
+                - coverage.sh
+          special_files:
+            count: 0
+            directories: {}
+          binary_files:
+            count: 0
+            directories: {}
+          read_error_files:
+            count: 0
+            directories: {}

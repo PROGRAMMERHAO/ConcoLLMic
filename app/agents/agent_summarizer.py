@@ -10,6 +10,7 @@ from loguru import logger
 from app.agents.common import (
     MAX_CODE_REQUEST_ATTEMPTS,
     AlreadySelectedBranchButNotReached,
+    DirectedTargetInfo,
     ExampleUserInput,
     ExecutionInformation,
     ExecutionTrace,
@@ -20,6 +21,7 @@ from app.agents.common import (
     parse_tool_arguments,
     wrap_between_tags,
 )
+from app.agents.directed import DirectedTarget, ReachabilityPlan
 from app.agents.tools import (
     BatchTool,
     CodeRequestTool,
@@ -100,6 +102,25 @@ Important Guidelines:
 - Be precise and unambiguous in constraint specifications
 - Keep explanations clear and concise
 """
+
+DIRECTED_SYSTEM_PROMPT_SUFFIX = """
+
+**DIRECTED TESTING MODE**
+
+Your PRIMARY objective is to reach the following target location(s):
+{target_descriptions}
+
+{reachability_plan_section}
+
+Your branch selection priority is now:
+1. **HIGHEST**: Branches that gate the target lines within the target function -- selecting these directly leads to covering the target
+2. **HIGH**: Branches in caller functions that control whether the target function is called
+3. **MEDIUM**: Branches that extend execution toward the target file or toward functions known to call the target function
+4. **LOW (fallback)**: Standard coverage-driven selection -- only use this if no branches relate to the target
+
+When generating path constraints, keep the target in mind -- the constraints should steer execution toward the target, not just toward an arbitrary uncovered branch.
+"""
+
 
 EXECUTION_INFORMATION_EXAMPLE = """
 ```python
@@ -431,6 +452,9 @@ def summarize(
     function_call_chain: str,
     already_selected_branch_but_not_reached: list[str] = [],
     parallel_num: int | None = None,
+    directed_targets: list[DirectedTarget] | None = None,
+    target_code_contexts: dict[str, str] | None = None,
+    reachability_plan: ReachabilityPlan | None = None,
 ) -> Generator[
     tuple[
         str,
@@ -461,8 +485,38 @@ def summarize(
     set_active_agent("summarizer")
 
     msg_thread: MessageThread = MessageThread()
+
+    # Build base system prompt, optionally augmented for directed mode
+    base_system_prompt = SYSTEM_PROMPT
+
+    if directed_targets:
+        target_descs = []
+        for i, t in enumerate(directed_targets):
+            if t.reached:
+                continue
+            func_info = f" (function: {t._target_function})" if t._target_function else ""
+            target_descs.append(
+                f"- {t.file_path}:{t.line_start}-{t.line_end}{func_info}"
+            )
+
+        reachability_section = ""
+        if reachability_plan and reachability_plan.steps:
+            reachability_section = (
+                "**Reachability Plan** (backward analysis of how to reach the target):\n"
+                + reachability_plan.format_for_prompt()
+                + "\n\nUse this plan to guide your branch selection. "
+                "Prefer branches that correspond to steps in the plan that haven't been satisfied yet."
+            )
+
+        if target_descs:
+            directed_suffix = DIRECTED_SYSTEM_PROMPT_SUFFIX.format(
+                target_descriptions="\n".join(target_descs),
+                reachability_plan_section=reachability_section,
+            )
+            base_system_prompt += directed_suffix
+
     system_prompt = (
-        Instructions(instructions=SYSTEM_PROMPT).to_xml()
+        Instructions(instructions=base_system_prompt).to_xml()
         + b"\n"
         + ExampleUserInput(
             example_user_input=wrap_between_tags(
@@ -510,6 +564,19 @@ def summarize(
                     ).to_xml()
                 )
                 if avoid_branches_str != ""
+                else b""
+            )
+            + (
+                (
+                    b"\n"
+                    + DirectedTargetInfo(
+                        directed_target_info="\n\n".join(
+                            f"**{key}:**\n```\n{code}\n```"
+                            for key, code in target_code_contexts.items()
+                        )
+                    ).to_xml()
+                )
+                if target_code_contexts
                 else b""
             )
         ).decode()

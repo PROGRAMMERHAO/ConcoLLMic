@@ -1,0 +1,15 @@
+LICENSE
+MANIFEST.in
+README.md
+setup.cfg
+setup.py
+venn/__init__.py
+venn/_backwards_compatibility.py
+venn/_constants.py
+venn/_venn.py
+venn.egg-info/PKG-INFO
+venn.egg-info/SOURCES.txt
+venn.egg-info/dependency_links.txt
+venn.egg-info/requires.txt
+venn.egg-info/top_level.txt
+venn.egg-info/zip-safe

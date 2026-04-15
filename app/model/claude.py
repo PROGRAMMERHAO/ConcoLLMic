@@ -92,9 +92,12 @@ class AnthropicModel(Model):
         try:
 
             if response_format == "json_object":
+                json_instruction = "\nYour response should start with { and end with }. DO NOT write anything else other than the json."
                 last_content = messages[-1]["content"]
-                last_content += "\nYour response should start with { and end with }. DO NOT write anything else other than the json."
-                messages[-1]["content"] = last_content
+                if isinstance(last_content, list):
+                    last_content.append({"type": "text", "text": json_instruction})
+                else:
+                    messages[-1]["content"] = last_content + json_instruction
 
             start_time = time.time()
             if self.name == "claude-3-7-sonnet-20250219-128k":

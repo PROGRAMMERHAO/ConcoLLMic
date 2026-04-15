@@ -1,0 +1,310 @@
+id: 8
+src_id: 6
+create_time: '2026-04-14 12:16:10.374'
+time_taken: 258
+states:
+  - SELECT
+  - SUMMARIZE
+  - SOLVE
+  - EXECUTE
+  - FINISHED
+is_target_covered: true
+new_coverage: false
+newly_covered_lines: 0
+is_satisfiable: true
+is_crash: false
+is_hang: false
+usage: |
+  TOTAL:
+    model: claude-sonnet-4-5-20250929
+    cost: $0.07217700
+    call_cnt: 7
+    latency: 62.52s
+    input_tokens: 47575
+    output_tokens: 3018
+    cache_read_tokens: 43910
+    cache_write_tokens: 3652
+  SUMMARIZE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.03045210
+      call_cnt: 3
+      latency: 27.42s
+      input_tokens: 28700
+      output_tokens: 1222
+      cache_read_tokens: 27682
+      cache_write_tokens: 1018
+    generate_path_constraint:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.01176165
+      call_cnt: 1
+      latency: 12.02s
+      input_tokens: 9911
+      output_tokens: 541
+      cache_read_tokens: 9635
+      cache_write_tokens: 276
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.01150995
+      call_cnt: 1
+      latency: 10.39s
+      input_tokens: 9154
+      output_tokens: 464
+      cache_read_tokens: 8893
+      cache_write_tokens: 261
+    select_target_branch:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00718050
+      call_cnt: 1
+      latency: 5.00s
+      input_tokens: 9635
+      output_tokens: 217
+      cache_read_tokens: 9154
+      cache_write_tokens: 481
+  SOLVE:
+    TOTAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.04172490
+      call_cnt: 4
+      latency: 35.11s
+      input_tokens: 18875
+      output_tokens: 1796
+      cache_read_tokens: 16228
+      cache_write_tokens: 2634
+    INITIAL:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00282390
+      call_cnt: 0
+      latency: 0.00s
+      input_tokens: 0
+      output_tokens: 0
+      cache_read_tokens: 0
+      cache_write_tokens: 0
+    think:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.02236890
+      call_cnt: 2
+      latency: 21.46s
+      input_tokens: 8899
+      output_tokens: 1043
+      cache_read_tokens: 7335
+      cache_write_tokens: 1558
+    execute_python:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.01276710
+      call_cnt: 1
+      latency: 8.02s
+      input_tokens: 4196
+      output_tokens: 502
+      cache_read_tokens: 3643
+      cache_write_tokens: 549
+    provide_solution:
+      model: claude-sonnet-4-5-20250929
+      cost: $0.00376500
+      call_cnt: 1
+      latency: 5.63s
+      input_tokens: 5780
+      output_tokens: 251
+      cache_read_tokens: 5250
+      cache_write_tokens: 527
+  EXECUTE:
+    TOTAL: {}
+target_branch: if (count <= FLOATS_BETWEEN_BUG) -> true in count.c:main at line 66
+target_file_lines: count.c:67-68
+target_lines_content: |2-
+      printf("BUG triggered!");
+      return 1;
+justification: This branch triggers a bug condition in the program (prints "BUG triggered!"
+  and returns 1). While it has 100% historical coverage, it represents an important
+  edge case where the count of floats between start and end is small (≤20). This branch
+  tests the program's behavior with very close floating-point bounds. The expected
+  covered lines are the bug message print and return statement.
+target_path_constraint: |-
+  To reach the branch where `if (count <= FLOATS_BETWEEN_BUG)` evaluates to true at line 66 in count.c:main, the following constraints must be satisfied:
+
+  1. **Command-Line Arguments Count**: `argc == 3` (program invoked with exactly 2 arguments)
+
+  2. **Argument Parsing**: 
+     - `argv[1]` and `argv[2]` must be parseable as floating-point numbers by `atof()`
+     - Let `start = atof(argv[1])` and `end = atof(argv[2])`
+
+  3. **NaN Check**: Neither start nor end should be NaN:
+     - `!isnan(start) && !isnan(end)`
+
+  4. **Ordering Constraint**: Start must not be greater than end:
+     - `start <= end`
+
+  5. **Range Constraints**: The values must be within the valid range:
+     - `start >= START_FLOAT` (where START_FLOAT = 1.0f)
+     - `end <= END_FLOAT` (where END_FLOAT = 1.00001f)
+
+  6. **Count Constraint**: The number of single-precision floating-point numbers between start (inclusive) and end (exclusive) must be at most FLOATS_BETWEEN_BUG (which is 20).
+     - The program counts floats by iterating through their bit representations: starting from `start`, it increments the unsigned integer representation of the float until it reaches `end`
+     - For this branch to be true: the count of distinct float values in the range [start, end) must satisfy `count <= 20`
+     - This requires start and end to be very close to each other in terms of their floating-point representation
+     - Specifically, there should be at most 20 representable float values between them
+
+  In summary: provide two command-line arguments representing floats in the range [1.0, 1.00001] that are ordered (first ≤ second) and are close enough that there are at most 20 distinct single-precision floating-point values between them.
+selected_cnt: 0
+successful_generation_cnt: 0
+exec_code: |-
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count", "1.0", "1.0"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+returncode: 1
+src_execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      printf("Usage: %s <float1> <float2>\n", argv[0]);
+      return 1;
+    }
+    
+    // Unexecuted code (lines 22-71) removed. Its line cov: 40/40 (100%)
+  }
+  ```
+
+crash_info:
+execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 3
+  [count.c] enter main 5
+  [count.c] enter main 7
+  [count.c] enter main 9
+  [count.c] enter main 11
+  [count.c] enter main 13
+  [count.c] enter main 14
+execution_summary: |2+
+
+  ```c
+  // count.c (72 lines total)
+  #include <assert.h>
+  #include <string.h>
+  #include <math.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+
+  #define START_FLOAT 1.0f
+  #define END_FLOAT 1.00001f
+  #define FLOATS_BETWEEN_BUG 20
+  #define FLOATS_BETWEEN_MAX 84
+
+  int main(int argc, char** argv) {
+    // The program counts all floats between start (inclusive) and end (exclusive)
+    float start;
+    float end;
+
+    if (argc != 3) {
+      // Unexecuted code (lines 18-19) removed. Its line cov: 2/2 (100%)
+    }
+    
+    start = atof(argv[1]);
+    end = atof(argv[2]);
+
+    // We constrain the bounds to be numbers, ordered, and within the
+    // range [START_FLOAT, END_FLOAT].  As a result, FLOATS_BETWEEN
+    // gives a bound on the number of single-precision floating-point
+    // numbers that lie in between these bounds.
+
+    if(isnan(start) || isnan(end)) {
+      // Unexecuted code (line 31) removed. Its line cov: 1/1 (100%)
+    }
+
+    if(start > end) {
+      // Unexecuted code (line 35) removed. Its line cov: 1/1 (100%)
+    }
+   
+    if(start < START_FLOAT) {
+      // Unexecuted code (line 39) removed. Its line cov: 1/1 (100%)
+    }
+
+    if(end > END_FLOAT) {
+      // Unexecuted code (line 43) removed. Its line cov: 1/1 (100%)
+    }
+
+    int count = 0;
+    
+    // We require that unsigned and float have the same size for the
+    // program to operate correctly
+    assert(sizeof(unsigned) == sizeof(float));
+
+    // Iterate through the floating-point numbers in the range by
+    // bit-conversion to unsigned.
+    for(float current = start; current != end; count++) {
+      // Unexecuted code (lines 55-58) removed. Its line cov: 4/4 (100%)
+    }
+
+    // Check that the count is non-negative and bounded above by
+    // FLOATS_BETWEEN
+    printf("Count is %d\n", count);
+    assert(count >= 0);
+    assert(FLOATS_BETWEEN_MAX);
+    if (count <= FLOATS_BETWEEN_BUG) {
+      printf("BUG triggered!");
+      return 1;
+    }
+    
+    return 0;
+  }
+  ```
+
+src_exec_code: |-
+  def execute_program(timeout: int) -> tuple[str, int]:
+      import signal
+      import subprocess
+
+      try:
+          result = subprocess.run(
+              ["./count"],
+              capture_output=True,
+              encoding="utf-8",
+              errors="replace",
+              timeout=timeout,
+          )
+          # Return stderr and the return code
+          return result.stderr, result.returncode
+      except subprocess.TimeoutExpired as e:
+          # Timeout occurred, also ensure to return stderr captured before timeout and return code -signal.SIGKILL
+          return e.stderr, -signal.SIGKILL
+      except Exception as e:
+          # ensure to raise the error if run failed
+          raise e
+src_execution_trace: |
+  [count.c] enter main 1
+  [count.c] enter main 2
+target_distance: 0
+directed_target_reached: false

@@ -16,15 +16,18 @@ from enum import Enum
 
 from loguru import logger
 
+from app.agents.agent_backward import backward_reasoning
 from app.agents.agent_scheduling import TestCaseScheduler
 from app.agents.agent_solver import review_solve, solve
 from app.agents.agent_summarizer import review_summary, summarize
 from app.agents.common import (
     FILE_TRACE_PATTERN,
     TRACE_PATTERN,
+    delete_instrumentation_from_code,
     filter_instr_print,
     set_concolic_execution_state,
 )
+from app.agents.directed import DirectedTargetManager
 from app.agents.coverage import Coverage
 from app.agents.states import ConcolicExecutionState, TestcaseState
 from app.agents.testcase import TestCase, TestCaseManager
@@ -179,6 +182,7 @@ def solve_and_execute(
     summarize_msg_thread: MessageThread,
     exec_timeout: int,
     disable_review: bool = True,
+    directed_hint: str | None = None,
 ):
     # process single test case, including solve and execute
     try:
@@ -219,6 +223,7 @@ def solve_and_execute(
                 ) = solve(
                     _format_exec_code(tc.src_exec_code),
                     tc.target_path_constraint,
+                    directed_hint=directed_hint,
                 )
 
                 solver_msg_thread = msg_thread.copy()
@@ -489,6 +494,8 @@ def run_concolic_execution(
     resume_in=None,
     plateau_slot=None,
     parallel_num=5,
+    directed_target_manager: DirectedTargetManager | None = None,
+    stop_on_target: bool = False,
 ):
     """Run concolic execution phase using a state machine approach.
 
@@ -627,6 +634,49 @@ def run_concolic_execution(
     update_ce_start_time(time.time() - time_bias)
     last_new_coverage_time = time.time() - time_bias
 
+    # Directed testing setup
+    directed_hint = None
+    if directed_target_manager:
+        directed_target_manager.ce_start_time = time.time() - time_bias
+        directed_target_manager.resolve_target_functions()
+
+        if not directed_target_manager.monitor_only:
+            if not directed_target_manager.no_backward_reasoning:
+                # Run backward reasoning from target
+                print_step("Running backward reasoning from target...")
+                _backward_source_files = {}
+                for _fpath in Coverage.get_instance().get_all_files():
+                    _tc = Coverage.get_instance().get_file_coverage(_fpath)
+                    if _tc:
+                        _clean = delete_instrumentation_from_code(_tc.line2code, _tc.comment_token)
+                        _backward_source_files[_fpath] = "\n".join(_clean.values())
+                reachability_plan, _backward_usage = backward_reasoning(
+                    directed_target_manager.targets,
+                    testcase_manager.get_testcase(0).exec_code,
+                    _backward_source_files,
+                )
+                directed_target_manager.reachability_plan = reachability_plan
+                logger.info("Backward reasoning complete: {} steps", len(reachability_plan.steps))
+                print_step(f"Reachability plan ready ({len(reachability_plan.steps)} steps)")
+
+                # Build directed hint for solver
+                target_descs = directed_target_manager.get_target_descriptions()
+                directed_hint = (
+                    f"Note: these constraints are designed to guide execution toward the following target(s):\n"
+                    f"{target_descs}\n"
+                    f"When choosing among valid solutions, prefer values that are more likely to steer execution toward the target."
+                )
+            else:
+                print_step("Backward reasoning disabled (--no-backward-reasoning): directed prompts still active")
+                logger.info("Backward reasoning skipped: no_backward_reasoning=True")
+        else:
+            print_step("Monitor-only mode: tracking target reach times without directing exploration")
+
+        # Update call graph from initial test case
+        initial_tc = testcase_manager.get_testcase(0)
+        if initial_tc and initial_tc.execution_trace:
+            directed_target_manager.update_call_graph_from_trace(initial_tc.execution_trace)
+
     under_gen_tc_msg_thread: dict[int, MessageThread] = (
         {}
     )  # if one testcase is finished, it should be removed
@@ -641,7 +691,13 @@ def run_concolic_execution(
         priority_queue.append(0)
         last_added_max_id = 0
     elif test_selection == TestCaseSelection.LLM:
-        scheduler = TestCaseScheduler()
+        scheduler = TestCaseScheduler(
+            directed_target_descriptions=(
+                directed_target_manager.get_target_descriptions()
+                if directed_target_manager and directed_target_manager.is_directed_active()
+                else None
+            )
+        )
 
     while round_cnt <= (rounds or float("inf")):
         logger.info(
@@ -656,8 +712,24 @@ def run_concolic_execution(
                 selection_usage_details = {"TOTAL": Usage()}
                 # select a test case
                 if test_selection == TestCaseSelection.LLM:
+                    # Update scheduler's directed descriptions based on current strategy
+                    if directed_target_manager:
+                        scheduler.directed_target_descriptions = (
+                            directed_target_manager.get_target_descriptions()
+                            if directed_target_manager.is_directed_active()
+                            else None
+                        )
+                        # Force rebuild of cached system prompt when strategy changes
+                        scheduler.already_cached_tc_ids.clear()
+
                     provided_tc_info: dict[int, str] = (
-                        testcase_manager.get_all_scheduling_information()
+                        testcase_manager.get_all_scheduling_information(
+                            directed_target_manager=(
+                                directed_target_manager
+                                if directed_target_manager and directed_target_manager.is_directed_active()
+                                else None
+                            )
+                        )
                     )
                     logger.info(
                         f"Selecting test case using LLM STRATEGY from list: {list(provided_tc_info.keys())}"
@@ -696,14 +768,39 @@ def run_concolic_execution(
                             priority_queue.append(tc_id)
                     last_added_max_id = testcase_manager.next_testcase_id - 1
 
-                    logger.info(
-                        f"Selecting test case using DFS from list: {priority_queue if len(priority_queue) > 0 else 'empty (will use the first testcase)'}"
-                    )
-                    if len(priority_queue) > 0:
-                        selected_testcase_id = priority_queue.pop()
+                    if (
+                        directed_target_manager is not None
+                        and directed_target_manager.is_directed_active()
+                        and len(priority_queue) > 0
+                    ):
+                        # Distance-aware selection: prefer the test case closest to the target.
+                        # Falls back to DFS order on ties (min() is stable for equal distances
+                        # since deque iteration is left-to-right and we want the most recent
+                        # among equals, so we negate index as tiebreaker).
+                        def _get_distance(tc_id):
+                            tc = testcase_manager.get_testcase(tc_id)
+                            d = tc.target_distance if (tc is not None and tc.target_distance is not None) else 4
+                            return d
+
+                        best_tc_id = min(priority_queue, key=_get_distance)
+                        priority_queue.remove(best_tc_id)
+                        selected_testcase_id = best_tc_id
+                        logger.info(
+                            f"Selecting test case using DIRECTED-DFS from list: {list(priority_queue)}, "
+                            f"chose #{best_tc_id} (distance={_get_distance(best_tc_id)})"
+                        )
+                        print_step(
+                            f"Using test case #{best_tc_id} as base (distance={_get_distance(best_tc_id)} to target)"
+                        )
                     else:
-                        # start again?
-                        selected_testcase_id = 0
+                        logger.info(
+                            f"Selecting test case using DFS from list: {priority_queue if len(priority_queue) > 0 else 'empty (will use the first testcase)'}"
+                        )
+                        if len(priority_queue) > 0:
+                            selected_testcase_id = priority_queue.pop()
+                        else:
+                            # start again?
+                            selected_testcase_id = 0
 
                 src_testcase = testcase_manager.get_testcase(selected_testcase_id)
 
@@ -767,6 +864,15 @@ def run_concolic_execution(
 
                 function_call_chain = " => ".join(formatted_func_call_chain_list)
 
+                # Prepare directed info for summarizer
+                _directed_targets = None
+                _target_code_contexts = None
+                _reachability_plan = None
+                if directed_target_manager and directed_target_manager.is_directed_active():
+                    _directed_targets = [t for t in directed_target_manager.targets if not t.reached]
+                    _target_code_contexts = directed_target_manager.get_target_code_contexts()
+                    _reachability_plan = directed_target_manager.reachability_plan
+
                 # Get generator and process generated branches
                 branches_generator = summarize(
                     _format_exec_code(src_testcase.exec_code),
@@ -776,6 +882,9 @@ def run_concolic_execution(
                         src_testcase.id
                     ),
                     parallel_num,
+                    directed_targets=_directed_targets,
+                    target_code_contexts=_target_code_contexts,
+                    reachability_plan=_reachability_plan,
                 )
 
                 # Process each generated branch with its usage and message thread
@@ -844,6 +953,11 @@ def run_concolic_execution(
                             ],
                             "exec_timeout": timeout,
                             "disable_review": True,
+                            "directed_hint": (
+                                directed_hint
+                                if directed_target_manager and directed_target_manager.is_directed_active()
+                                else None
+                            ),
                         },
                     )
 
@@ -895,6 +1009,41 @@ def run_concolic_execution(
 
                 crash_cnt += sum(1 for tc in under_gen_tcs if tc.is_crash)
                 hang_cnt += sum(1 for tc in under_gen_tcs if tc.is_hang)
+
+                # Directed testing: update call graph, check targets, update strategy
+                if directed_target_manager:
+                    min_distance = 4
+                    for tc in under_gen_tcs:
+                        if tc.execution_trace:
+                            directed_target_manager.update_call_graph_from_trace(
+                                tc.execution_trace
+                            )
+                            tc.target_distance = directed_target_manager.compute_min_distance(
+                                tc.execution_trace
+                            )
+                            directed_target_manager.check_target_reached(
+                                tc.id, tc.execution_trace
+                            )
+                            if tc.target_distance < min_distance:
+                                min_distance = tc.target_distance
+                            tc.save_to_disk()
+
+                    # Update adaptive strategy
+                    strategy = directed_target_manager.progress.update_strategy(
+                        round_cnt, min_distance
+                    )
+                    print_step(
+                        f"Directed: min_distance={min_distance}, strategy={strategy}"
+                    )
+
+                    # Save directed state
+                    directed_target_manager.save(out_dir)
+
+                    # Check if all targets reached
+                    if stop_on_target and directed_target_manager.all_targets_reached():
+                        logger.info("All directed targets reached! Stopping.")
+                        print_step("All directed targets REACHED!")
+                        break
 
                 under_gen_tc_msg_thread.clear()
                 under_gen_tcs.clear()
@@ -986,5 +1135,34 @@ def setup_run_parser(parser):
         help="number of parallel testcase generation",
         required=False,
         default=5,
+    )
+    # Directed testing arguments
+    run_parser.add_argument(
+        "--target",
+        type=str,
+        action="append",
+        help="directed target location (file:line or file:line_start-line_end). Can be specified multiple times.",
+        required=False,
+        default=None,
+    )
+    run_parser.add_argument(
+        "--monitor-target",
+        type=str,
+        action="append",
+        help="monitor-only target location (file:line or file:line_start-line_end): logs time to reach but does not direct exploration. Can be specified multiple times.",
+        required=False,
+        default=None,
+    )
+    run_parser.add_argument(
+        "--stop-on-target",
+        action="store_true",
+        help="stop execution once all directed targets are reached",
+        default=False,
+    )
+    run_parser.add_argument(
+        "--no-backward-reasoning",
+        action="store_true",
+        help="disable the backward reasoning step when using --target (directed prompts and distance-aware selection remain active)",
+        default=False,
     )
     return run_parser

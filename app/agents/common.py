@@ -132,6 +132,14 @@ class AlreadySelectedBranchButNotReached(
     already_selected_branch_but_not_reached: str
 
 
+class DirectedTargetInfo(BaseXmlModel, tag="directed_target_info"):
+    directed_target_info: str
+
+
+class TargetDistance(BaseXmlModel, tag="target_distance"):
+    target_distance: str
+
+
 class ResponseParseException(Exception):
     pass
 
