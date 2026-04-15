@@ -1,0 +1,19 @@
+targets:
+- file_path: count.c
+  line_start: 66
+  line_end: 66
+  reached: true
+  reached_by_tc_id: 1
+  reached_at_time: 102.19001007080078
+progress:
+  distance_history:
+  - !!python/tuple
+    - 1
+    - 0
+  - !!python/tuple
+    - 2
+    - 0
+  best_distance: 0
+  stall_counter: 1
+  current_strategy: monitor-only
+call_graph_size: 0

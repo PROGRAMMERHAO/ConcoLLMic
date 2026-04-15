@@ -399,9 +399,17 @@ class DirectedTargetManager:
 
     def save(self, out_dir: str):
         """Save directed target state to disk."""
+        if self.monitor_only:
+            effective_mode = "monitor-only"
+        elif self.no_backward_reasoning:
+            effective_mode = "directed-no-backward-reasoning"
+        else:
+            effective_mode = "directed"
+
         data = {
+            "mode": effective_mode,
             "targets": [t.to_dict() for t in self.targets],
-            "progress": self.progress.to_dict(),
+            "progress": self.progress.to_dict() if not self.monitor_only else "(n/a — monitor-only)",
             "call_graph_size": sum(len(v) for v in self.call_graph.values()),
         }
         path = os.path.join(out_dir, "directed_targets.yaml")
