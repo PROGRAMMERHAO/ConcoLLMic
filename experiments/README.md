@@ -70,6 +70,61 @@ TIMEOUT=48h docker-compose up --build \
 
 ---
 
+## Directed Testing Experiments
+
+The `krep` benchmark includes a pre-configured directed testing experiment targeting a known vulnerability at `krep.c:1556`. These services are defined in `docker-compose.override.yml` (automatically merged with `docker-compose.yml` by Docker Compose).
+
+### ConcoLLMic Directed Variants
+
+Three ConcoLLMic modes are available for comparison:
+
+```bash
+cd experiments/benchmarks/c_c++_programs
+
+# Full directed mode: backward reasoning + distance-aware DFS, stops on target
+ANTHROPIC_API_KEY="your_api_key" TIMEOUT=14400 \
+docker-compose up --build krep-directed
+
+# Directed without backward reasoning: distance-aware DFS only
+ANTHROPIC_API_KEY="your_api_key" TIMEOUT=14400 \
+docker-compose up --build krep-directed-nobr
+
+# Monitor-only: undirected exploration that tracks when the target is first reached
+ANTHROPIC_API_KEY="your_api_key" TIMEOUT=14400 \
+docker-compose up --build krep-monitor
+```
+
+### Baseline Tool Directed Variants
+
+All baseline tools have corresponding directed variants. These tools do not perform directed execution — they fuzz/run normally, and `run.sh` records when `krep.c:1556` is first covered during post-run replay:
+
+```bash
+cd experiments/benchmarks/c_c++_programs
+
+# Build base images first
+docker-compose build klee aflplusplus symcc symsan
+
+# Run all baseline directed variants
+TIMEOUT=14400 docker-compose up --build \
+    krep-klee-directed \
+    krep-klee-pending-directed \
+    krep-aflplusplus-directed \
+    krep-symcc-directed \
+    krep-symsan-directed
+```
+
+### Output Files
+
+Results are written to `krep/results/<tool>-<timestamp>-<hostname>/`:
+
+| File | Description |
+|------|-------------|
+| `target_reached.log` | Records elapsed time when `krep.c:1556` was first covered; ends with `SUMMARY: <tool> reached/did NOT reach krep.c:1556 after Xs` |
+| `coverage_summary.csv` | Time-series coverage with columns: `Time` (Unix timestamp), `l_per`/`l_abs` (line coverage % and count), `b_per`/`b_abs` (branch coverage % and count), `covered_times_of_line` (target line hit count) |
+| `execution_command.log` | Full command, environment variables, and start time for the run |
+
+---
+
 ## Cleanup
 
 Stop and remove all containers:

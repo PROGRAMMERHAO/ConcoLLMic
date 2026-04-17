@@ -163,7 +163,11 @@ def signal_handler(signum, frame, log_file_path: str, directed_target_manager=No
 def setup_model():
     """Setup and initialize model"""
     register_all_models()
-    set_model("claude-sonnet-4-5-20250929")
+    # Use OpenRouter if OPENROUTER_API_KEY is set, otherwise default to Claude
+    if os.environ.get("OPENROUTER_API_KEY"):
+        set_model("meta-llama/llama-4-maverick:free")
+    else:
+        set_model("claude-sonnet-4-5-20250929")
 
 
 def initialize_settings(log_dir: str = LOG_DIR):

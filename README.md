@@ -331,6 +331,18 @@ count.c:66          # single line
 krep.c:1556-1570    # line range
 ```
 
+### Directed Testing Modes
+
+Three modes are available depending on your goal:
+
+| Mode | Flag | Behavior |
+|------|------|----------|
+| Directed | `--target FILE:LINE --stop-on-target` | Backward reasoning + distance-aware DFS; stops when target is reached |
+| Directed (no backward reasoning) | `--target FILE:LINE --stop-on-target --no-backward-reasoning` | Distance-aware DFS only; no backward reachability analysis |
+| Monitor-only | `--monitor-target FILE:LINE` | Undirected exploration; tracks when target is first reached without guiding toward it |
+
+The monitor-only mode is useful as a controlled baseline — it measures how long undirected ConcoLLMic takes to naturally reach the target, for comparison with the directed modes.
+
 ### Output
 
 The LOG SUMMARY at the end of a run includes directed target results:
@@ -342,6 +354,10 @@ All 1 target(s) reached. Total time to reach all: 12.3s
 ```
 
 The current directed target state (distances, strategy, reach status) is also saved to `directed_targets.yaml` in the output directory after each round.
+
+In Docker-based experiments (see [Running Large-Scale Experiments](#running-large-scale-experiments)), each tool's result directory also contains:
+- `target_reached.log` — records the first time the target line was covered and the elapsed time; ends with a `SUMMARY` line indicating whether the target was reached within the timeout
+- `coverage_summary.csv` — time-series coverage data with columns: `Time` (Unix timestamp), `l_per`/`l_abs` (line coverage %), `b_per`/`b_abs` (branch coverage %), `covered_times_of_line` (hit count for the directed target line)
 
 ---
 

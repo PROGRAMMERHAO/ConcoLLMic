@@ -27,8 +27,8 @@ from tenacity import (
 from app.log import log_and_cprint, log_and_print
 
 # Retry parameters (adjust as needed)
-NUM_RETRIES = 3
-RETRY_MIN_WAIT = 5  # seconds
+NUM_RETRIES = 5
+RETRY_MIN_WAIT = 65  # seconds — Anthropic Tier 1 rate limit resets every 60s
 RETRY_MAX_WAIT = 300  # seconds
 RETRY_MULTIPLIER = 2
 

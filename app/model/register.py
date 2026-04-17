@@ -19,6 +19,10 @@ def register_all_models() -> None:
     common.register_model(gpt.Gpt4_0613())
     common.register_model(gpt.Gpt_o1mini())
 
+    common.register_model(gpt.OpenRouterLlama4Maverick())
+    common.register_model(gpt.OpenRouterDeepSeekR1())
+    common.register_model(gpt.OpenRouterGeminiFlash())
+
     common.register_model(claude.Claude3Opus())
     common.register_model(claude.Claude3Sonnet())
     common.register_model(claude.Claude3Haiku())

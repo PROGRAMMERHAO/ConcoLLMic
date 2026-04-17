@@ -372,3 +372,44 @@ class Gpt4_0613(OpenaiModel):
 class Gpt4o_mini_20240718(OpenaiModel):
     def __init__(self):
         super().__init__("gpt-4o-mini-2024-07-18", 4096, 0.00000015, 0.0000006)
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter models (OpenAI-compatible API, set OPENROUTER_API_KEY env var)
+# Free models available at https://openrouter.ai/models?q=free
+# ---------------------------------------------------------------------------
+
+class OpenRouterModel(OpenaiModel):
+    """Base class for OpenRouter models. Uses OPENROUTER_API_KEY and OpenRouter base URL."""
+
+    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+    def setup(self) -> None:
+        if self.client is None:
+            key = self.check_api_key()
+            self.client = OpenAI(api_key=key, base_url=self.OPENROUTER_BASE_URL)
+
+    def check_api_key(self) -> str:
+        key = os.getenv("OPENROUTER_API_KEY")
+        if not key:
+            print("Please set the OPENROUTER_API_KEY env var")
+            sys.exit(1)
+        return key
+
+
+class OpenRouterLlama4Maverick(OpenRouterModel):
+    def __init__(self):
+        super().__init__("meta-llama/llama-4-maverick:free", 4096, 0.0, 0.0)
+        self.note = "Free Llama 4 Maverick via OpenRouter"
+
+
+class OpenRouterDeepSeekR1(OpenRouterModel):
+    def __init__(self):
+        super().__init__("deepseek/deepseek-r1:free", 4096, 0.0, 0.0)
+        self.note = "Free DeepSeek R1 via OpenRouter"
+
+
+class OpenRouterGeminiFlash(OpenRouterModel):
+    def __init__(self):
+        super().__init__("google/gemini-2.0-flash-exp:free", 8192, 0.0, 0.0)
+        self.note = "Free Gemini 2.0 Flash via OpenRouter"
